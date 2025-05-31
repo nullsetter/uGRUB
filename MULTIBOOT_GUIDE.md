@@ -39,21 +39,47 @@ The script will check for these dependencies automatically:
 - `blkid` - Block device identification
 - `mount`/`umount` - Mounting operations
 
+### Optional Tools (for enhanced experience):
+- `pv` - Progress display during ISO copying (provides real-time progress bars)
+- `rsync` - Alternative copy method with progress (fallback if pv unavailable)
+
 ### Installation on Ubuntu/Debian:
 ```bash
 sudo apt update
-sudo apt install fdisk exfatprogs grub2-common grub-pc-bin grub-efi-amd64-bin util-linux
+sudo apt install fdisk exfatprogs grub2-common grub-pc-bin grub-efi-amd64-bin util-linux pv
 ```
 
 ### Installation on Arch Linux:
 ```bash
-sudo pacman -S util-linux exfatprogs grub
+sudo pacman -S util-linux exfatprogs grub pv
 ```
 
 ### Installation on Fedora/CentOS:
 ```bash
-sudo dnf install util-linux exfatprogs grub2-tools grub2-efi-x64
+sudo dnf install util-linux exfatprogs grub2-tools grub2-efi-x64 pv
 ```
+
+### Copy Methods and Progress Display
+
+The script uses an intelligent fallback system for copying ISO files:
+
+1. **Primary: `pv` method** (if available)
+   - ✅ Real-time progress bar with transfer speed
+   - ✅ ETA (estimated time remaining)
+   - ✅ Visual feedback during large file transfers
+   - ✅ Example: `2.98GB 100% 1.62GB/s 0:00:01`
+
+2. **Secondary: `rsync` method** (fallback)
+   - ✅ Progress indication with transfer statistics
+   - ✅ Resume capability for interrupted transfers
+   - ✅ Efficient copying algorithm
+
+3. **Tertiary: `cp` method** (final fallback)
+   - ✅ Basic copy functionality
+   - ✅ Reliable on all systems
+   - ⚠️ No progress indication
+
+**Installation recommendation:** Install `pv` for the best user experience during ISO copying operations.
 
 ## Quick Start
 

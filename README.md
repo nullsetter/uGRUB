@@ -194,6 +194,36 @@ Reboot your Computer, and enter your Boot Menu. Set the Boot Order to boot from 
 
 Just installing grub bootloader is not enough to boot the ISOs, We've to configure grub to load the bootable files from the ISO. Well Lucky you, I've already done that for you. I've configured grub to have nice themes with distro logo, added a lot of menu entries to boot various ISO files. However, there's a bit of configuration you need to do before you can actually boot an ISO. Follow the steps below to finish the config for you : 
 
+### Enhanced Automated Scripts
+
+**🚀 For an automated approach, use the enhanced preparation script:**
+```bash
+./prepare_multiboot_usb.sh
+```
+
+This script automates the entire process with intelligent USB detection, automatic UEFI/BIOS configuration, and enhanced ISO handling with progress display.
+
+### Optional Dependencies for Enhanced Experience
+
+**📦 Install `pv` for progress display during ISO copying:**
+```bash
+# Ubuntu/Debian
+sudo apt install pv
+
+# Arch Linux
+sudo pacman -S pv
+
+# Fedora/CentOS
+sudo dnf install pv
+```
+
+The `pv` (Pipe Viewer) package provides real-time progress display when copying large ISO files. Without it, the script automatically falls back to `rsync` or `cp` methods.
+
+**✅ With pv installed:** Real-time progress bar with transfer speed
+**⚠️ Without pv:** Progress indication via rsync or basic copy
+
+### Manual Configuration (Original Method)
+
 - First, Clone this repository in your home directory
 ```
 $ cd $HOME
