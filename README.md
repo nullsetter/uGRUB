@@ -8,6 +8,64 @@
   <a href="https://github.com/adi1090x/uGRUB#changing-themes" target="_blank"><img alt="undefined" src="https://img.shields.io/badge/Theming-orange?style=for-the-badge"></a>
 </p>
 
+## 🚀 Enhanced Two-Partition Design
+
+This repository now includes an **enhanced automated script** that implements a **two-partition layout** for optimal UEFI/BIOS compatibility and support for large ISO files (>4GB).
+
+### Why Two Partitions?
+
+The original approach used a single exFAT partition, which could cause UEFI boot issues because:
+- **EFI System Partitions (ESP) must be FAT32** for proper UEFI compatibility
+- GRUB's EFI application might not load properly from exFAT filesystems
+- Some firmware implementations are strict about ESP formatting requirements
+
+### Two-Partition Solution
+
+Our enhanced design uses:
+
+**Partition 1 (EFI System Partition - ESP):**
+- **Size:** 1GB
+- **Format:** FAT32 (UEFI specification compliant)
+- **Contents:** GRUB bootloader, themes, fonts, configuration files
+- **Purpose:** Ensures reliable UEFI booting on all systems
+
+**Partition 2 (Data Partition):**
+- **Size:** Remaining USB space
+- **Format:** exFAT (supports files >4GB)
+- **Contents:** ISO files, including large distributions
+- **Purpose:** Maximum compatibility and large file support
+
+### Benefits
+
+✅ **Maximum UEFI Compatibility:** FAT32 ESP ensures proper UEFI booting  
+✅ **Large File Support:** exFAT data partition supports ISOs >4GB  
+✅ **Universal Compatibility:** Works with both UEFI and BIOS systems  
+✅ **Standard Compliant:** Follows UEFI specification requirements  
+✅ **Automated Setup:** Complete two-partition creation and configuration  
+
+### Quick Start
+
+```bash
+# Use the enhanced automated script
+./prepare_multiboot_usb.sh
+
+# Or for minimal interaction
+./prepare_multiboot_usb.sh --auto
+
+# For troubleshooting
+./prepare_multiboot_usb.sh --debug
+```
+
+The script automatically:
+- Creates the two-partition layout
+- Formats partitions with appropriate filesystems
+- Installs GRUB to the ESP with proper configuration
+- Copies ISOs to the data partition
+- Generates menu entries for detected ISOs
+
+---
+
+## Original Manual Instructions
 
 The ultimate guide to install and configure `grub2` bootloader on USB Flash Drive to boot multiple ISO files.
 

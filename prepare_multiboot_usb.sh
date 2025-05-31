@@ -3,7 +3,7 @@
 #==============================================#
 #     Multiboot USB Preparation Script        #
 #     Based on uGRUB by Aditya Shakya         #
-#     Enhanced with automatic ISO detection    #
+#     Enhanced with Two-Partition Design      #
 #     + Robust umount/cleanup handling         #
 #==============================================#
 
@@ -137,8 +137,9 @@ print_usage() {
     echo
     echo "Features:"
     echo "  • Automatic USB detection and selection"
+    echo "  • Two-partition layout: FAT32 ESP + exFAT data partition"
     echo "  • UEFI/BIOS compatibility (GPT/MBR auto-detection)"
-    echo "  • exFAT filesystem (supports files >4GB)"
+    echo "  • Optimal compatibility: FAT32 ESP for bootloader, exFAT for ISOs"
     echo "  • Enhanced ISO analysis and menu generation"
     echo "  • Multiple themes and customization options"
     echo "  • Comprehensive error handling and diagnostics"
@@ -1115,7 +1116,7 @@ safe_umount() {
 }
 
 partition_usb() {
-    print_info "Partitioning USB device $USB_DEVICE..."
+    print_info "Partitioning USB device $USB_DEVICE for two-partition layout..."
     
     # Enhanced device cleanup
     if ! force_cleanup_usb_device "$USB_DEVICE"; then
@@ -1143,35 +1144,61 @@ partition_usb() {
         run_cmd sudo fdisk -l "$USB_DEVICE"
     fi
     
+    # Get USB size in sectors for partition calculations
+    local usb_sectors=$(sudo fdisk -l "$USB_DEVICE" | grep "Disk $USB_DEVICE" | awk '{print $7}')
+    if [[ -z "$usb_sectors" ]]; then
+        print_error "Could not determine USB size in sectors"
+        exit 1
+    fi
+    
+    # Calculate partition sizes (ESP: 1GB, Data: remaining)
+    local esp_size_mb=1024
+    local esp_size_sectors=$((esp_size_mb * 2048))  # 1MB = 2048 sectors
+    local data_start_sector=$((2048 + esp_size_sectors))
+    
+    print_info "Creating two-partition layout:"
+    print_info "  Partition 1 (ESP): ${esp_size_mb}MB FAT32"
+    print_info "  Partition 2 (Data): Remaining space exFAT"
+    
     # Detect if UEFI system and create appropriate partition table
     if [[ -d "/sys/firmware/efi" ]]; then
         print_info "Creating GPT partition table for UEFI compatibility..."
         local sfdisk_result=0
         if [[ "$DEBUG_MODE" == "true" ]]; then
-            print_info "🐛 DEBUG: Running sfdisk with GPT table..."
-            cat << 'EOF' | sudo sfdisk --force "$USB_DEVICE" || sfdisk_result=$?
+            print_info "🐛 DEBUG: Running sfdisk with GPT table for two partitions..."
+            cat << EOF | sudo sfdisk --force "$USB_DEVICE" || sfdisk_result=$?
 label: gpt
-type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, bootable
+start=2048, size=${esp_size_sectors}, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, bootable, name="EFI System"
+start=${data_start_sector}, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, name="Multiboot Data"
 EOF
         else
-            cat << 'EOF' | run_cmd sudo sfdisk --force "$USB_DEVICE" || sfdisk_result=$?
+            cat << EOF | run_cmd sudo sfdisk --force "$USB_DEVICE" || sfdisk_result=$?
 label: gpt
-type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, bootable
+start=2048, size=${esp_size_sectors}, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, bootable, name="EFI System"
+start=${data_start_sector}, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, name="Multiboot Data"
 EOF
         fi
         
         if [[ $sfdisk_result -ne 0 ]]; then
             print_warning "sfdisk failed, trying with fdisk..."
             if [[ "$DEBUG_MODE" == "true" ]]; then
-                print_info "🐛 DEBUG: Running fdisk with GPT commands..."
-                (timeout 30 sudo fdisk "$USB_DEVICE" << 'EOF'
+                print_info "🐛 DEBUG: Running fdisk with GPT commands for two partitions..."
+                (timeout 30 sudo fdisk "$USB_DEVICE" << EOF
 g
 n
 1
+2048
++${esp_size_mb}M
+t
+1
+1
+n
+2
 
 
 t
-1
+2
+20
 w
 EOF
 ) || {
@@ -1180,14 +1207,22 @@ EOF
                     exit 1
                 }
             else
-                if ! (timeout 30 run_cmd sudo fdisk "$USB_DEVICE" << 'EOF'
+                if ! (timeout 30 run_cmd sudo fdisk "$USB_DEVICE" << EOF
 g
 n
 1
+2048
++${esp_size_mb}M
+t
+1
+1
+n
+2
 
 
 t
-1
+2
+20
 w
 EOF
 ); then
@@ -1201,32 +1236,39 @@ EOF
         print_info "Creating MBR partition table for BIOS compatibility..."
         local sfdisk_result=0
         if [[ "$DEBUG_MODE" == "true" ]]; then
-            print_info "🐛 DEBUG: Running sfdisk with MBR table..."
-            cat << 'EOF' | sudo sfdisk --force "$USB_DEVICE" || sfdisk_result=$?
+            print_info "🐛 DEBUG: Running sfdisk with MBR table for two partitions..."
+            cat << EOF | sudo sfdisk --force "$USB_DEVICE" || sfdisk_result=$?
 label: dos
-type=c, bootable
+start=2048, size=${esp_size_sectors}, type=c, bootable
+start=${data_start_sector}, type=83
 EOF
         else
-            cat << 'EOF' | run_cmd sudo sfdisk --force "$USB_DEVICE" || sfdisk_result=$?
+            cat << EOF | run_cmd sudo sfdisk --force "$USB_DEVICE" || sfdisk_result=$?
 label: dos
-type=c, bootable
+start=2048, size=${esp_size_sectors}, type=c, bootable
+start=${data_start_sector}, type=83
 EOF
         fi
         
         if [[ $sfdisk_result -ne 0 ]]; then
             print_warning "sfdisk failed, trying with fdisk..."
             if [[ "$DEBUG_MODE" == "true" ]]; then
-                print_info "🐛 DEBUG: Running fdisk with MBR commands..."
-                (timeout 30 sudo fdisk "$USB_DEVICE" << 'EOF'
+                print_info "🐛 DEBUG: Running fdisk with MBR commands for two partitions..."
+                (timeout 30 sudo fdisk "$USB_DEVICE" << EOF
 o
 n
 p
 1
-
-
+2048
++${esp_size_mb}M
 a
 t
 c
+n
+p
+2
+
+
 w
 EOF
 ) || {
@@ -1235,16 +1277,21 @@ EOF
                     exit 1
                 }
             else
-                if ! (timeout 30 run_cmd sudo fdisk "$USB_DEVICE" << 'EOF'
+                if ! (timeout 30 run_cmd sudo fdisk "$USB_DEVICE" << EOF
 o
 n
 p
 1
-
-
+2048
++${esp_size_mb}M
 a
 t
 c
+n
+p
+2
+
+
 w
 EOF
 ); then
@@ -1261,20 +1308,24 @@ EOF
     run_cmd sudo partprobe "$USB_DEVICE" || true
     run_cmd sudo udevadm settle || true
     
-    # Robust wait for partition to appear
-    print_info "Waiting for partition to be recognized (up to 60s)..."
-    local partition="${USB_DEVICE}1"
+    # Robust wait for partitions to appear
+    print_info "Waiting for partitions to be recognized (up to 60s)..."
+    local esp_partition="${USB_DEVICE}1"
+    local data_partition="${USB_DEVICE}2"
     local wait_count=0
-    while [[ ! -e "$partition" && $wait_count -lt 60 ]]; do
+    
+    while [[ (! -e "$esp_partition" || ! -e "$data_partition") && $wait_count -lt 60 ]]; do
         sleep 1
         ((wait_count++))
-        if (( wait_count % 5 == 0 )); then
-            print_info "...still waiting for $partition ($wait_count/60)"
+        if (( wait_count % 10 == 0 )); then
+            print_info "...still waiting for partitions ($wait_count/60)"
+            print_info "ESP: $esp_partition exists: $([[ -e "$esp_partition" ]] && echo "YES" || echo "NO")"
+            print_info "Data: $data_partition exists: $([[ -e "$data_partition" ]] && echo "YES" || echo "NO")"
         fi
     done
     
-    if [[ ! -e "$partition" ]]; then
-        print_error "Partition $partition was not created after 60 seconds!"
+    if [[ ! -e "$esp_partition" || ! -e "$data_partition" ]]; then
+        print_error "Partitions were not created after 60 seconds!"
         print_info "Diagnostics:"
         run_cmd_with_output lsblk "$USB_DEVICE" || true
         print_info "Recent kernel messages:"
@@ -1283,184 +1334,276 @@ EOF
         exit 1
     fi
     
-    print_success "USB device partitioned successfully"
+    print_success "USB device partitioned successfully with two-partition layout"
+    print_success "ESP: $esp_partition (${esp_size_mb}MB)"
+    print_success "Data: $data_partition (remaining space)"
 }
 
 format_usb() {
-    print_info "Formatting USB partition..."
+    print_info "Formatting USB partitions..."
     
-    local partition="${USB_DEVICE}1"
+    local esp_partition="${USB_DEVICE}1"
+    local data_partition="${USB_DEVICE}2"
     
-    # Wait for partition to be available
+    # Wait for partitions to be available
     local count=0
-    while [[ ! -e "$partition" && $count -lt 10 ]]; do
+    while [[ (! -e "$esp_partition" || ! -e "$data_partition") && $count -lt 10 ]]; do
         sleep 1
         ((count++))
-        print_info "Waiting for partition to be available... ($count/10)"
+        print_info "Waiting for partitions to be available... ($count/10)"
     done
     
-    if [[ ! -e "$partition" ]]; then
-        print_error "Partition $partition not found after partitioning"
+    if [[ ! -e "$esp_partition" || ! -e "$data_partition" ]]; then
+        print_error "Partitions not found after partitioning"
+        print_info "ESP: $esp_partition exists: $([[ -e "$esp_partition" ]] && echo "YES" || echo "NO")"
+        print_info "Data: $data_partition exists: $([[ -e "$data_partition" ]] && echo "YES" || echo "NO")"
         exit 1
     fi
     
-    # Format as exFAT
+    # Format ESP as FAT32
+    print_info "Formatting ESP partition ($esp_partition) as FAT32..."
     if [[ "$DEBUG_MODE" == "true" ]]; then
-        print_info "🐛 DEBUG: Formatting partition $partition as exFAT..."
-        sudo mkfs.exfat -n "Multiboot" "$partition"
+        print_info "🐛 DEBUG: Formatting ESP partition $esp_partition as FAT32..."
+        sudo mkfs.vfat -F 32 -n "ESP" "$esp_partition"
     else
-        run_cmd sudo mkfs.exfat -n "Multiboot" "$partition"
+        run_cmd sudo mkfs.vfat -F 32 -n "ESP" "$esp_partition"
     fi
+    print_success "ESP partition formatted as FAT32"
     
-    print_success "USB partition formatted as exFAT"
+    # Format Data partition as exFAT
+    print_info "Formatting Data partition ($data_partition) as exFAT..."
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        print_info "🐛 DEBUG: Formatting Data partition $data_partition as exFAT..."
+        sudo mkfs.exfat -n "Multiboot" "$data_partition"
+    else
+        run_cmd sudo mkfs.exfat -n "Multiboot" "$data_partition"
+    fi
+    print_success "Data partition formatted as exFAT"
+    
+    print_success "Both USB partitions formatted successfully"
+    print_info "ESP (FAT32): $esp_partition - for GRUB bootloader"
+    print_info "Data (exFAT): $data_partition - for ISO files"
 }
 
 install_grub() {
-    print_info "Installing GRUB bootloader..."
+    print_info "Installing GRUB bootloader to ESP..."
     
-    local mount_point="/mnt/multiboot_usb"
-    local partition="${USB_DEVICE}1"
+    local esp_mount_point="/mnt/multiboot_esp"
+    local esp_partition="${USB_DEVICE}1"
     
-    # Create mount point and mount
-    run_cmd sudo mkdir -p "$mount_point"
+    # Create mount point and mount ESP
+    run_cmd sudo mkdir -p "$esp_mount_point"
     if [[ "$DEBUG_MODE" == "true" ]]; then
-        print_info "🐛 DEBUG: Mounting $partition to $mount_point..."
-        sudo mount "$partition" "$mount_point"
+        print_info "🐛 DEBUG: Mounting ESP $esp_partition to $esp_mount_point..."
+        sudo mount "$esp_partition" "$esp_mount_point"
     else
-        run_cmd sudo mount "$partition" "$mount_point"
+        run_cmd sudo mount "$esp_partition" "$esp_mount_point"
     fi
+    
+    # Verify mount
+    if ! mount | grep -q "$esp_mount_point"; then
+        print_error "Failed to mount ESP partition"
+        exit 1
+    fi
+    
+    print_success "ESP mounted at $esp_mount_point"
     
     # Detect boot mode (UEFI or BIOS)
     local grub_target
     if [[ -d "/sys/firmware/efi" ]]; then
-        print_info "UEFI system detected"
+        print_info "UEFI system detected - installing GRUB for UEFI"
         if [[ "$(uname -m)" == "x86_64" ]]; then
             grub_target="x86_64-efi"
         else
             grub_target="i386-efi"
         fi
         
-        # Install GRUB for UEFI
+        # Install GRUB for UEFI to ESP
         if [[ "$DEBUG_MODE" == "true" ]]; then
-            print_info "🐛 DEBUG: Installing GRUB for UEFI (target: $grub_target)..."
+            print_info "🐛 DEBUG: Installing GRUB for UEFI (target: $grub_target) to ESP..."
             sudo grub-install --force --removable --target="$grub_target" \
-                             --boot-directory="$mount_point/boot" \
-                             --efi-directory="$mount_point" "$USB_DEVICE"
+                             --boot-directory="$esp_mount_point/boot" \
+                             --efi-directory="$esp_mount_point" "$USB_DEVICE"
         else
             run_cmd sudo grub-install --force --removable --target="$grub_target" \
-                                     --boot-directory="$mount_point/boot" \
-                                     --efi-directory="$mount_point" "$USB_DEVICE"
+                                     --boot-directory="$esp_mount_point/boot" \
+                                     --efi-directory="$esp_mount_point" "$USB_DEVICE"
         fi
     else
-        print_info "BIOS system detected"
+        print_info "BIOS system detected - installing GRUB for BIOS"
         grub_target="i386-pc"
         
-        # Install GRUB for BIOS
+        # Install GRUB for BIOS to ESP (boot files) but target the whole device
         if [[ "$DEBUG_MODE" == "true" ]]; then
-            print_info "🐛 DEBUG: Installing GRUB for BIOS (target: $grub_target)..."
+            print_info "🐛 DEBUG: Installing GRUB for BIOS (target: $grub_target) to ESP..."
             sudo grub-install --force --removable --target="$grub_target" \
-                             --boot-directory="$mount_point/boot" "$USB_DEVICE"
+                             --boot-directory="$esp_mount_point/boot" "$USB_DEVICE"
         else
             run_cmd sudo grub-install --force --removable --target="$grub_target" \
-                                     --boot-directory="$mount_point/boot" "$USB_DEVICE"
+                                     --boot-directory="$esp_mount_point/boot" "$USB_DEVICE"
         fi
     fi
     
     if [[ $? -eq 0 ]]; then
-        print_success "GRUB installed successfully"
+        print_success "GRUB installed successfully to ESP"
+        print_info "GRUB target: $grub_target"
+        print_info "Boot directory: $esp_mount_point/boot"
+        if [[ -d "/sys/firmware/efi" ]]; then
+            print_info "EFI directory: $esp_mount_point"
+        fi
     else
         print_error "GRUB installation failed"
-        safe_umount "$mount_point"
+        safe_umount "$esp_mount_point"
         exit 1
     fi
     
-    # Unmount
-    safe_umount "$mount_point"
-    run_cmd sudo rmdir "$mount_point"
+    # Verify installation
+    if [[ -d "/sys/firmware/efi" ]]; then
+        if [[ -f "$esp_mount_point/EFI/BOOT/BOOTX64.EFI" ]] || [[ -f "$esp_mount_point/EFI/BOOT/BOOTIA32.EFI" ]]; then
+            print_success "EFI boot files verified in ESP"
+        else
+            print_warning "EFI boot files not found - installation may have failed"
+        fi
+    fi
+    
+    if [[ -d "$esp_mount_point/boot/grub" ]]; then
+        print_success "GRUB boot directory created in ESP"
+    else
+        print_error "GRUB boot directory not found - installation failed"
+        safe_umount "$esp_mount_point"
+        exit 1
+    fi
+    
+    # Unmount ESP
+    safe_umount "$esp_mount_point"
+    run_cmd sudo rmdir "$esp_mount_point"
 }
 
 copy_grub_config() {
-    print_info "Copying GRUB configuration files..."
+    print_info "Copying GRUB configuration files to ESP..."
     
-    local mount_point="/mnt/multiboot_usb"
-    local partition="${USB_DEVICE}1"
+    local esp_mount_point="/mnt/multiboot_esp"
+    local esp_partition="${USB_DEVICE}1"
     
-    # Mount the USB
-    run_cmd sudo mkdir -p "$mount_point"
+    # Mount the ESP
+    run_cmd sudo mkdir -p "$esp_mount_point"
     if [[ "$DEBUG_MODE" == "true" ]]; then
-        print_info "🐛 DEBUG: Mounting $partition to $mount_point for GRUB config copy..."
-        sudo mount "$partition" "$mount_point"
+        print_info "🐛 DEBUG: Mounting ESP $esp_partition to $esp_mount_point for GRUB config copy..."
+        sudo mount "$esp_partition" "$esp_mount_point"
     else
-        run_cmd sudo mount "$partition" "$mount_point"
+        run_cmd sudo mount "$esp_partition" "$esp_mount_point"
     fi
     
     # Copy GRUB configuration
     if [[ -d "$GRUB_CONFIG_DIR" ]]; then
         if [[ "$DEBUG_MODE" == "true" ]]; then
-            print_info "🐛 DEBUG: Copying GRUB config from $GRUB_CONFIG_DIR to $mount_point/boot/grub/..."
-            sudo cp -rf "$GRUB_CONFIG_DIR"/* "$mount_point/boot/grub/"
+            print_info "🐛 DEBUG: Copying GRUB config from $GRUB_CONFIG_DIR to $esp_mount_point/boot/grub/..."
+            sudo cp -rf "$GRUB_CONFIG_DIR"/* "$esp_mount_point/boot/grub/"
         else
-            run_cmd sudo cp -rf "$GRUB_CONFIG_DIR"/* "$mount_point/boot/grub/"
+            run_cmd sudo cp -rf "$GRUB_CONFIG_DIR"/* "$esp_mount_point/boot/grub/"
         fi
-        print_success "GRUB configuration files copied"
+        print_success "GRUB configuration files copied to ESP"
     else
         print_error "GRUB configuration directory not found: $GRUB_CONFIG_DIR"
-        safe_umount "$mount_point"
+        safe_umount "$esp_mount_point"
         exit 1
     fi
     
-    # Unmount
-    safe_umount "$mount_point"
-    run_cmd sudo rmdir "$mount_point"
+    # Unmount ESP
+    safe_umount "$esp_mount_point"
+    run_cmd sudo rmdir "$esp_mount_point"
 }
 
 get_usb_uuid() {
-    print_info "Getting USB UUID..."
+    print_info "Getting USB partition UUIDs..."
     
-    local partition="${USB_DEVICE}1"
-    # USB_UUID=$(run_cmd sudo blkid -s UUID -o value "$partition" || true)
-
+    local esp_partition="${USB_DEVICE}1"
+    local data_partition="${USB_DEVICE}2"
+    
+    # Get ESP UUID
     if [[ "$DEBUG_MODE" == "true" ]]; then
-        print_info "🐛 DEBUG: Attempting to get UUID directly with: sudo blkid -s UUID -o value \"$partition\""
+        print_info "🐛 DEBUG: Getting ESP UUID from: $esp_partition"
     fi
-
-    # Capture only the stdout of blkid; redirect its stderr to /dev/null
-    local raw_uuid
-    raw_uuid=$(sudo blkid -s UUID -o value "$partition" 2>/dev/null)
-    local blkid_exit_code=$?
-
+    
+    local raw_esp_uuid
+    raw_esp_uuid=$(sudo blkid -s UUID -o value "$esp_partition" 2>/dev/null)
+    local esp_blkid_exit_code=$?
+    
     if [[ "$DEBUG_MODE" == "true" ]]; then
-        if [[ $blkid_exit_code -eq 0 && -n "$raw_uuid" ]]; then
-            print_info "🐛 DEBUG: Raw output from blkid: '$raw_uuid'"
-        elif [[ $blkid_exit_code -ne 0 ]]; then
-            print_error "🐛 DEBUG: blkid command failed with exit code: $blkid_exit_code"
+        if [[ $esp_blkid_exit_code -eq 0 && -n "$raw_esp_uuid" ]]; then
+            print_info "🐛 DEBUG: Raw ESP UUID from blkid: '$raw_esp_uuid'"
+        elif [[ $esp_blkid_exit_code -ne 0 ]]; then
+            print_error "🐛 DEBUG: ESP blkid command failed with exit code: $esp_blkid_exit_code"
         else
-            print_warning "🐛 DEBUG: blkid command succeeded but returned an empty UUID."
+            print_warning "🐛 DEBUG: ESP blkid command succeeded but returned an empty UUID."
         fi
     fi
-
-    # Sanitize the UUID: keep only alphanumeric characters and hyphens
-    USB_UUID=$(echo "$raw_uuid" | tr -dc '[:alnum:]-')
-
-    if [[ -n "$USB_UUID" ]]; then
-        print_success "USB UUID: $USB_UUID"
-        if [[ "$DEBUG_MODE" == "true" ]]; then
-            print_info "🐛 DEBUG: Full blkid output for $partition:"
-            run_cmd_with_output sudo blkid "$partition"
+    
+    # Sanitize the ESP UUID
+    ESP_UUID=$(echo "$raw_esp_uuid" | tr -dc '[:alnum:]-')
+    
+    # Get Data partition UUID
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        print_info "🐛 DEBUG: Getting Data partition UUID from: $data_partition"
+    fi
+    
+    local raw_data_uuid
+    raw_data_uuid=$(sudo blkid -s UUID -o value "$data_partition" 2>/dev/null)
+    local data_blkid_exit_code=$?
+    
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        if [[ $data_blkid_exit_code -eq 0 && -n "$raw_data_uuid" ]]; then
+            print_info "🐛 DEBUG: Raw Data UUID from blkid: '$raw_data_uuid'"
+        elif [[ $data_blkid_exit_code -ne 0 ]]; then
+            print_error "🐛 DEBUG: Data blkid command failed with exit code: $data_blkid_exit_code"
+        else
+            print_warning "🐛 DEBUG: Data blkid command succeeded but returned an empty UUID."
         fi
+    fi
+    
+    # Sanitize the Data UUID
+    DATA_UUID=$(echo "$raw_data_uuid" | tr -dc '[:alnum:]-')
+    
+    # Keep USB_UUID as alias for Data UUID for backward compatibility
+    USB_UUID="$DATA_UUID"
+    
+    # Report results
+    if [[ -n "$ESP_UUID" ]]; then
+        print_success "ESP UUID: $ESP_UUID"
     else
-        print_error "Failed to get USB UUID"
+        print_error "Failed to get ESP UUID"
         if [[ "$DEBUG_MODE" == "true" ]]; then
-            print_info "🐛 DEBUG: Troubleshooting UUID detection..."
-            print_info "🐛 DEBUG: Partition table:"
-            run_cmd_with_output sudo fdisk -l "$USB_DEVICE"
-            print_info "🐛 DEBUG: All block device UUIDs:"
-            run_cmd_with_output sudo blkid
+            print_info "🐛 DEBUG: ESP partition details:"
+            run_cmd_with_output sudo blkid "$esp_partition"
         fi
-        # In auto mode, script might proceed and fail later.
-        # Consider if exiting here is better if UUID is critical and not found.
-        # For now, matching original behavior of trying to continue.
-        # exit 1 # Potentially exit if UUID is absolutely critical
+    fi
+    
+    if [[ -n "$DATA_UUID" ]]; then
+        print_success "Data partition UUID: $DATA_UUID"
+    else
+        print_error "Failed to get Data partition UUID"
+        if [[ "$DEBUG_MODE" == "true" ]]; then
+            print_info "🐛 DEBUG: Data partition details:"
+            run_cmd_with_output sudo blkid "$data_partition"
+        fi
+    fi
+    
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        print_info "🐛 DEBUG: Full blkid output for both partitions:"
+        run_cmd_with_output sudo blkid "$esp_partition" "$data_partition"
+    fi
+    
+    # Check if we have at least the data UUID (critical for ISO access)
+    if [[ -z "$DATA_UUID" ]]; then
+        print_error "Data partition UUID is required for ISO access"
+        if [[ "$AUTO_MODE" != "true" ]]; then
+            read -p "Continue without Data UUID? (This may cause boot issues) (y/n): " continue_without_uuid
+            if [[ "$continue_without_uuid" != "y" && "$continue_without_uuid" != "Y" ]]; then
+                exit 1
+            fi
+        else
+            print_warning "Auto mode: Continuing without Data UUID (may cause boot issues)"
+        fi
     fi
 }
 
@@ -1491,36 +1634,76 @@ detect_partition_table_type() {
 }
 
 update_grub_config() {
-    print_info "Updating GRUB configuration with USB UUID and partition type..."
+    print_info "Updating GRUB configuration with partition UUIDs and two-partition layout..."
     
-    local mount_point="/mnt/multiboot_usb"
-    local partition="${USB_DEVICE}1"
+    local esp_mount_point="/mnt/multiboot_esp"
+    local esp_partition="${USB_DEVICE}1"
     
-    # Mount the USB
-    run_cmd sudo mkdir -p "$mount_point"
+    # Mount the ESP
+    run_cmd sudo mkdir -p "$esp_mount_point"
     if [[ "$DEBUG_MODE" == "true" ]]; then
-        print_info "🐛 DEBUG: Mounting $partition to $mount_point for GRUB config update..."
-        sudo mount "$partition" "$mount_point"
+        print_info "🐛 DEBUG: Mounting ESP $esp_partition to $esp_mount_point for GRUB config update..."
+        sudo mount "$esp_partition" "$esp_mount_point"
     else
-        run_cmd sudo mount "$partition" "$mount_point"
+        run_cmd sudo mount "$esp_partition" "$esp_mount_point"
     fi
     
     if [[ "$DEBUG_MODE" == "true" ]]; then
         print_info "🐛 DEBUG: Original grub.cfg content (first 20 lines):"
-        head -20 "$mount_point/boot/grub/grub.cfg" || true
+        head -20 "$esp_mount_point/boot/grub/grub.cfg" || true
     fi
     
-    # Update grub.cfg with the actual UUID using # as a delimiter for sed
-    if [[ -z "$USB_UUID" ]]; then
-        print_error "Cannot update grub.cfg: USB_UUID is empty!"
-        print_warning "GRUB configuration will NOT be updated with UUID. This will likely cause boot issues."
+    # Update grub.cfg with the data partition UUID for ISO access
+    if [[ -z "$DATA_UUID" ]]; then
+        print_error "Cannot update grub.cfg: DATA_UUID is empty!"
+        print_warning "GRUB configuration will NOT be updated with Data UUID. This will likely cause boot issues."
     else
         if [[ "$DEBUG_MODE" == "true" ]]; then
-            print_info "🐛 DEBUG: Updating UUID placeholders with '$USB_UUID' using '#' delimiter in sed..."
+            print_info "🐛 DEBUG: Updating YOUR_UUID placeholders with Data UUID '$DATA_UUID' using '#' delimiter in sed..."
         fi
-        # Use # as delimiter for sed to avoid issues if USB_UUID could contain /
-        run_cmd sudo sed -i "s#YOUR_UUID#${USB_UUID}#g" "$mount_point/boot/grub/grub.cfg"
+        # Use # as delimiter for sed to avoid issues if UUID could contain /
+        # This updates references to the data partition where ISOs are stored
+        run_cmd sudo sed -i "s#YOUR_UUID#${DATA_UUID}#g" "$esp_mount_point/boot/grub/grub.cfg"
     fi
+    
+    # Add specific configuration for two-partition layout
+    print_info "Configuring GRUB for two-partition layout..."
+    
+    # Create a helper configuration snippet for the data partition
+    local data_config_snippet="
+# Two-partition multiboot configuration
+# ESP (current): UUID=${ESP_UUID:-unknown}
+# Data partition: UUID=${DATA_UUID:-unknown}
+
+# Set default search path for ISOs to data partition
+set iso_root='hd0,${PARTITION_REF/1/2}'
+if [ -n \"${DATA_UUID}\" ]; then
+    search --no-floppy --fs-uuid --set=iso_root ${DATA_UUID}
+fi
+
+# Helper function to set ISO path
+function set_iso_path {
+    set isofile=\"\$1\"
+    # ISOs are stored on the data partition
+    set root=\$iso_root
+}
+"
+    
+    # Insert the configuration snippet at the beginning of the main config
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        print_info "🐛 DEBUG: Adding two-partition configuration snippet..."
+    fi
+    
+    # Create temporary file with new content
+    local temp_config="/tmp/grub_config_temp"
+    {
+        echo "$data_config_snippet"
+        cat "$esp_mount_point/boot/grub/grub.cfg"
+    } > "$temp_config"
+    
+    # Replace the original config
+    run_cmd sudo cp "$temp_config" "$esp_mount_point/boot/grub/grub.cfg"
+    run_cmd rm -f "$temp_config"
     
     # Update partition table references based on detected type
     if [[ "$PARTITION_TYPE" == "gpt" ]]; then
@@ -1529,42 +1712,55 @@ update_grub_config() {
             print_info "🐛 DEBUG: Applying GPT-specific updates..."
         fi
         # Replace insmod part_msdos with part_gpt
-        run_cmd sudo sed -i "s/insmod part_msdos/insmod part_gpt/g" "$mount_point/boot/grub/grub.cfg"
-        # Replace msdos1 with gpt1
-        run_cmd sudo sed -i "s/msdos1/gpt1/g" "$mount_point/boot/grub/grub.cfg"
-        # Replace (hd0,1) with (hd0,gpt1) for better compatibility
-        run_cmd sudo sed -i "s/'(hd0,1)'/'(hd0,gpt1)'/g" "$mount_point/boot/grub/grub.cfg"
-        run_cmd sudo sed -i "s/=(hd0,1)/=(hd0,gpt1)/g" "$mount_point/boot/grub/grub.cfg"
-        # Also update hint references
-        run_cmd sudo sed -i "s/ahci0,msdos1/ahci0,gpt1/g" "$mount_point/boot/grub/grub.cfg"
+        run_cmd sudo sed -i "s/insmod part_msdos/insmod part_gpt/g" "$esp_mount_point/boot/grub/grub.cfg"
+        # Update partition references
+        run_cmd sudo sed -i "s/msdos1/gpt1/g" "$esp_mount_point/boot/grub/grub.cfg"
+        run_cmd sudo sed -i "s/msdos2/gpt2/g" "$esp_mount_point/boot/grub/grub.cfg"
+        # Replace (hd0,1) and (hd0,2) with GPT equivalents
+        run_cmd sudo sed -i "s/'(hd0,1)'/'(hd0,gpt1)'/g" "$esp_mount_point/boot/grub/grub.cfg"
+        run_cmd sudo sed -i "s/'(hd0,2)'/'(hd0,gpt2)'/g" "$esp_mount_point/boot/grub/grub.cfg"
+        run_cmd sudo sed -i "s/=(hd0,1)/=(hd0,gpt1)/g" "$esp_mount_point/boot/grub/grub.cfg"
+        run_cmd sudo sed -i "s/=(hd0,2)/=(hd0,gpt2)/g" "$esp_mount_point/boot/grub/grub.cfg"
+        # Update hint references
+        run_cmd sudo sed -i "s/ahci0,msdos1/ahci0,gpt1/g" "$esp_mount_point/boot/grub/grub.cfg"
+        run_cmd sudo sed -i "s/ahci0,msdos2/ahci0,gpt2/g" "$esp_mount_point/boot/grub/grub.cfg"
     else
         print_info "Using MBR/DOS partition table references (default)..."
         if [[ "$DEBUG_MODE" == "true" ]]; then
             print_info "🐛 DEBUG: Applying MBR-specific updates..."
         fi
-        # Ensure part_msdos is used (should already be correct in template)
-        run_cmd sudo sed -i "s/insmod part_gpt/insmod part_msdos/g" "$mount_point/boot/grub/grub.cfg"
-        # Ensure msdos1 is used (should already be correct in template)
-        run_cmd sudo sed -i "s/gpt1/msdos1/g" "$mount_point/boot/grub/grub.cfg"
-        # Ensure (hd0,1) format is used for MBR
-        run_cmd sudo sed -i "s/'(hd0,gpt1)'/'(hd0,1)'/g" "$mount_point/boot/grub/grub.cfg"
-        run_cmd sudo sed -i "s/=(hd0,gpt1)/=(hd0,1)/g" "$mount_point/boot/grub/grub.cfg"
-        # Ensure hint references are correct
-        run_cmd sudo sed -i "s/ahci0,gpt1/ahci0,msdos1/g" "$mount_point/boot/grub/grub.cfg"
+        # Ensure part_msdos is used
+        run_cmd sudo sed -i "s/insmod part_gpt/insmod part_msdos/g" "$esp_mount_point/boot/grub/grub.cfg"
+        # Ensure msdos references are used
+        run_cmd sudo sed -i "s/gpt1/msdos1/g" "$esp_mount_point/boot/grub/grub.cfg"
+        run_cmd sudo sed -i "s/gpt2/msdos2/g" "$esp_mount_point/boot/grub/grub.cfg"
+        # Ensure (hd0,1) and (hd0,2) format is used for MBR
+        run_cmd sudo sed -i "s/'(hd0,gpt1)'/'(hd0,1)'/g" "$esp_mount_point/boot/grub/grub.cfg"
+        run_cmd sudo sed -i "s/'(hd0,gpt2)'/'(hd0,2)'/g" "$esp_mount_point/boot/grub/grub.cfg"
+        run_cmd sudo sed -i "s/=(hd0,gpt1)/=(hd0,1)/g" "$esp_mount_point/boot/grub/grub.cfg"
+        run_cmd sudo sed -i "s/=(hd0,gpt2)/=(hd0,2)/g" "$esp_mount_point/boot/grub/grub.cfg"
+        # Update hint references
+        run_cmd sudo sed -i "s/ahci0,gpt1/ahci0,msdos1/g" "$esp_mount_point/boot/grub/grub.cfg"
+        run_cmd sudo sed -i "s/ahci0,gpt2/ahci0,msdos2/g" "$esp_mount_point/boot/grub/grub.cfg"
     fi
     
     if [[ "$DEBUG_MODE" == "true" ]]; then
-        print_info "🐛 DEBUG: Updated grub.cfg content (first 30 lines):"
-        head -30 "$mount_point/boot/grub/grub.cfg" || true
+        print_info "🐛 DEBUG: Updated grub.cfg content (first 40 lines):"
+        head -40 "$esp_mount_point/boot/grub/grub.cfg" || true
         print_info "🐛 DEBUG: Checking for UUID replacement:"
-        grep -n "UUID" "$mount_point/boot/grub/grub.cfg" | head -5 || true
+        grep -n "UUID" "$esp_mount_point/boot/grub/grub.cfg" | head -5 || true
+        print_info "🐛 DEBUG: Checking for two-partition configuration:"
+        grep -n "iso_root" "$esp_mount_point/boot/grub/grub.cfg" | head -3 || true
     fi
     
-    print_success "GRUB configuration updated with UUID ($USB_UUID) and partition type ($PARTITION_TYPE)"
+    print_success "GRUB configuration updated for two-partition layout"
+    print_info "ESP UUID: ${ESP_UUID:-not available}"
+    print_info "Data UUID: ${DATA_UUID:-not available} (for ISO access)"
+    print_info "Partition type: $PARTITION_TYPE"
     
-    # Unmount
-    safe_umount "$mount_point"
-    run_cmd sudo rmdir "$mount_point"
+    # Unmount ESP
+    safe_umount "$esp_mount_point"
+    run_cmd sudo rmdir "$esp_mount_point"
 }
 
 copy_iso_files() {
@@ -1582,22 +1778,27 @@ copy_iso_files() {
     
     if [[ ${#iso_files[@]} -eq 0 ]]; then
         print_warning "No ISO files found in $ISOS_DIR"
-        print_info "You can add ISO files later to the root of the USB drive"
+        print_info "You can add ISO files later to the data partition of the USB drive"
         return
     fi
     
-    local mount_point="/mnt/multiboot_usb"
-    local partition="${USB_DEVICE}1"
+    local data_mount_point="/mnt/multiboot_data"
+    local data_partition="${USB_DEVICE}2"
     
-    # Mount the USB
-    sudo mkdir -p "$mount_point"
-    sudo mount "$partition" "$mount_point"
+    # Mount the Data partition
+    sudo mkdir -p "$data_mount_point"
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        print_info "🐛 DEBUG: Mounting data partition $data_partition to $data_mount_point..."
+        sudo mount "$data_partition" "$data_mount_point"
+    else
+        run_cmd sudo mount "$data_partition" "$data_mount_point"
+    fi
     
     # Check available space
-    local available_space_kb=$(df "$mount_point" | tail -1 | awk '{print $4}')
+    local available_space_kb=$(df "$data_mount_point" | tail -1 | awk '{print $4}')
     local available_space_gb=$((available_space_kb / 1024 / 1024))
     
-    print_info "Available space on USB: ${available_space_gb}GB"
+    print_info "Available space on Data partition: ${available_space_gb}GB"
     
     # Analyze and calculate total ISO size with validation
     local total_size_kb=0
@@ -1648,26 +1849,27 @@ copy_iso_files() {
         echo
         read -p "Continue without copying ISOs? (y/n): " skip_copy
         if [[ "$skip_copy" != "y" && "$skip_copy" != "Y" ]]; then
-            safe_umount "$mount_point"
-            sudo rmdir "$mount_point"
+            safe_umount "$data_mount_point"
+            sudo rmdir "$data_mount_point"
             exit 1
         fi
-        print_info "Skipping ISO copy - you can add them manually later"
-        safe_umount "$mount_point"
-        sudo rmdir "$mount_point"
+        print_info "Skipping ISO copy - you can add them manually later to the data partition"
+        safe_umount "$data_mount_point"
+        sudo rmdir "$data_mount_point"
         return
     fi
     
     # Auto-proceed if space is sufficient (minimal interaction)
-    print_success "Space check passed - proceeding with ISO copy..."
+    print_success "Space check passed - proceeding with ISO copy to data partition..."
     echo
     
     # Copy ISOs with progress and real-time analysis
     local copied_count=0
     local failed_count=0
     
-    print_info "=== STARTING ISO COPY PROCESS ==="
+    print_info "=== STARTING ISO COPY PROCESS (to Data Partition) ==="
     print_info "Total ISOs to copy: ${#valid_isos[@]}"
+    print_info "Target: Data partition ($data_partition) mounted at $data_mount_point"
     echo
     
     for iso in "${valid_isos[@]}"; do
@@ -1677,16 +1879,16 @@ copy_iso_files() {
         
         print_info "📀 Processing ISO $((copied_count + failed_count + 1))/${#valid_isos[@]}: $iso_name (${iso_size_gb}GB)"
         
-        # Check if ISO already exists on USB (skip if same size)
-        if [[ -f "$mount_point/$iso_name" ]]; then
-            local existing_size=$(du -k "$mount_point/$iso_name" | cut -f1)
+        # Check if ISO already exists on Data partition (skip if same size)
+        if [[ -f "$data_mount_point/$iso_name" ]]; then
+            local existing_size=$(du -k "$data_mount_point/$iso_name" | cut -f1)
             if [[ $existing_size -eq $iso_size_kb ]]; then
                 print_success "✓ $iso_name already exists with correct size - skipping"
                 ((copied_count++))
                 continue
             else
                 print_warning "⚠ $iso_name exists but size differs - replacing..."
-                sudo rm -f "$mount_point/$iso_name" 2>/dev/null || true
+                sudo rm -f "$data_mount_point/$iso_name" 2>/dev/null || true
             fi
         fi
         
@@ -1695,70 +1897,62 @@ copy_iso_files() {
 
         # Determine copy method and execute
         if command -v rsync &> /dev/null; then
-            print_info "🔄 Copying $iso_name using rsync with progress..."
+            print_info "🔄 Copying $iso_name to data partition using rsync with progress..."
             # Using --info=progress2 for overall percentage.
-            # --partial allows resuming.
-            # --no-inc-recursive because we are copying files one by one.
-            # --no-owner and --no-group to prevent chown errors on exFAT/FAT32 filesystems.
-            # --times (-t) is kept from --archive to preserve modification times if possible.
-            if sudo rsync --times --partial --info=progress2 --no-inc-recursive --no-owner --no-group "$iso" "$mount_point/"; then
+            if sudo rsync --times --partial --info=progress2 --no-inc-recursive --no-owner --no-group "$iso" "$data_mount_point/"; then
                 copy_to_buffer_success=true
-                print_success "✅ $iso_name copied to system buffers (via rsync)."
+                print_success "✅ $iso_name copied to data partition buffers (via rsync)."
             else
                 copy_error_msg="rsync copy failed"
                 print_warning "❌ rsync copy to buffer failed for $iso_name."
             fi
-        elif command -v cp &> /dev/null; then # cp should almost always be available
-            print_info "🔄 Copying $iso_name using cp (no detailed progress for this step)..."
-            if sudo cp "$iso" "$mount_point/"; then
+        elif command -v cp &> /dev/null; then
+            print_info "🔄 Copying $iso_name to data partition using cp (no detailed progress)..."
+            if sudo cp "$iso" "$data_mount_point/"; then
                 copy_to_buffer_success=true
-                print_success "✅ $iso_name copied to system buffers (via cp)."
+                print_success "✅ $iso_name copied to data partition buffers (via cp)."
             else
                 copy_error_msg="cp copy failed"
                 print_error "❌ cp copy to buffer failed for $iso_name."
             fi
         else
-            # This case should be rare as 'cp' is a very basic utility.
             copy_error_msg="Neither rsync nor cp command found"
             print_error "❌ Critical: Neither rsync nor cp found. Cannot copy $iso_name."
-            # No need to increment failed_count here if we bail or mark all remaining as failed.
-            # For simplicity, let the loop increment failed_count based on copy_to_buffer_success.
         fi
         
         # Process result of copy to buffer
         if [[ "$copy_to_buffer_success" == "true" ]]; then
             # Verify copy integrity (checks against buffer/cache initially)
-            local copied_size_kb=$(du -k "$mount_point/$iso_name" | cut -f1 2>/dev/null || echo "0")
+            local copied_size_kb=$(du -k "$data_mount_point/$iso_name" | cut -f1 2>/dev/null || echo "0")
             if [[ $copied_size_kb -eq $iso_size_kb ]]; then
                 print_success "✓ Size verification in buffer passed for $iso_name"
             else
                 print_warning "⚠ Size mismatch in buffer detected for $iso_name (expected: ${iso_size_kb}KB, got: ${copied_size_kb}KB)"
-                # This could indicate an issue even before sync, but sync might still be attempted.
             fi
             
             # Force sync for this file to ensure it's physically written
-            print_info "📡 Ensuring $iso_name is physically written from buffers to USB..."
+            print_info "📡 Ensuring $iso_name is physically written from buffers to data partition..."
             
             # Check dirty data before sync
             local dirty_before_kb=$(grep "^Dirty:" /proc/meminfo | awk '{print $2}' || echo 0)
             local dirty_before_mb=$((dirty_before_kb / 1024))
             
             if [[ $dirty_before_kb -gt 100000 ]]; then  # > 100MB dirty
-                local sync_message="💾 Writing ~${dirty_before_mb}MB of buffered data for $iso_name..."
+                local sync_message="💾 Writing ~${dirty_before_mb}MB of buffered data for $iso_name to data partition..."
             else
-                local sync_message="💾 Flushing remaining buffered data for $iso_name..."
+                local sync_message="💾 Flushing remaining buffered data for $iso_name to data partition..."
             fi
                 
-            local sync_successful=false # Assume failure until sync confirms success
+            local sync_successful=false
             # Use the new sync function with spinner and custom message
             if sync_with_spinner "$sync_message"; then 
                 sync_successful=true
-                ((copied_count++)) # Increment successful physical copies
+                ((copied_count++))
             else
-                print_error "❌ Sync operation FAILED after attempting to write $iso_name."
+                print_error "❌ Sync operation FAILED after attempting to write $iso_name to data partition."
                 print_warning "   This indicates a potentially serious issue with writing to the USB drive."
-                print_warning "   The integrity of $iso_name on the USB is not guaranteed."
-                ((failed_count++)) # Mark as failed if sync reports an error
+                print_warning "   The integrity of $iso_name on the data partition is not guaranteed."
+                ((failed_count++))
             fi
             
             if [[ "$sync_successful" == "true" ]]; then
@@ -1786,14 +1980,14 @@ copy_iso_files() {
     # Final summary
     echo
     print_info "=== ISO COPY SUMMARY ==="
-    print_success "✅ Successfully copied: $copied_count ISOs"
+    print_success "✅ Successfully copied: $copied_count ISOs to data partition"
     if [[ $failed_count -gt 0 ]]; then
         print_error "❌ Failed to copy: $failed_count ISOs"
     fi
     print_info "📊 Total processed: $((copied_count + failed_count))/${#valid_isos[@]} ISOs"
     
     if [[ $copied_count -gt 0 ]]; then
-        print_success "🎉 ISO copy process completed with $copied_count successful copies!"
+        print_success "🎉 ISO copy process completed with $copied_count successful copies to data partition!"
     else
         print_warning "⚠ No ISO files were copied successfully"
     fi
@@ -1802,54 +1996,178 @@ copy_iso_files() {
     print_info "📝 Proceeding to menu generation..."
     
     # Unmount for next step
-    safe_umount "$mount_point"
-    sudo rmdir "$mount_point"
+    safe_umount "$data_mount_point"
+    sudo rmdir "$data_mount_point"
     
     # Return success to continue script execution
     return 0
 }
 
-generate_menu_entries() {
-    print_info "Analyzing ISO files and generating menu entries..."
+# Generate advanced menu entries for two-partition layout using ISO detection
+generate_advanced_menu_entries_content_two_partition() {
+    local data_mount_point="$1"
+    shift
+    local iso_files=("$@")
+    local entries=""
+    local entries_count=0
     
-    local mount_point="/mnt/multiboot_usb"
-    local partition="${USB_DEVICE}1"
-    
-    # Mount the USB with error handling
-    sudo mkdir -p "$mount_point"
-    if ! sudo mount "$partition" "$mount_point"; then
-        print_error "Failed to mount USB for menu generation"
-        print_warning "Menu entries will need to be created manually later."
-        return 0  # Don't exit the script, just skip menu generation
+    # Determine correct partition reference based on partition table type
+    local data_partition_ref
+    if [[ "$PARTITION_TYPE" == "gpt" ]]; then
+        data_partition_ref="gpt2"
+    else
+        data_partition_ref="2"
     fi
     
-    # Find ISO files on the USB
-    local iso_files=($(find "$mount_point" -maxdepth 1 -name "*.iso" -type f 2>/dev/null))
+    print_info "🔍 Analyzing ${#iso_files[@]} ISO(s) with advanced detection (two-partition layout)..."
     
-    if [[ ${#iso_files[@]} -eq 0 ]]; then
-        print_info "No ISO files found on USB. Menu entries can be configured manually later."
-        safe_umount "$mount_point"
-        sudo rmdir "$mount_point" 2>/dev/null || true
+    for iso_path in "${iso_files[@]}"; do
+        local iso_name=$(basename "$iso_path")
+        print_info "📝 Analyzing $iso_name with advanced detection..."
+        
+        # Use the detection function to analyze the ISO
+        if detect_iso_boot_files "$iso_path"; then
+            print_success "✓ Detected: $ISO_DISTRO (kernel: $ISO_KERNEL, initrd: $ISO_INITRD)"
+            
+            # Set appropriate boot parameters based on distribution
+            set_iso_boot_params "$ISO_DISTRO" "$data_mount_point"
+            
+            # Generate entry title
+            local entry_title=""
+            case "$ISO_DISTRO" in
+                ubuntu) entry_title="Ubuntu - $iso_name" ;;
+                kubuntu) entry_title="Kubuntu - $iso_name" ;;
+                xubuntu) entry_title="Xubuntu - $iso_name" ;;
+                lubuntu) entry_title="Lubuntu - $iso_name" ;;
+                mint) entry_title="Linux Mint - $iso_name" ;;
+                elementary) entry_title="elementary OS - $iso_name" ;;
+                debian) entry_title="Debian - $iso_name" ;;
+                debian-live) entry_title="Debian Live - $iso_name" ;;
+                arch) entry_title="Arch Linux - $iso_name" ;;
+                manjaro) entry_title="Manjaro - $iso_name" ;;
+                antergos) entry_title="Antergos - $iso_name" ;;
+                fedora) entry_title="Fedora - $iso_name" ;;
+                centos) entry_title="CentOS - $iso_name" ;;
+                opensuse) entry_title="openSUSE - $iso_name" ;;
+                *) entry_title="$ISO_DISTRO - $iso_name" ;;
+            esac
+            
+            local class_name=$(echo "$ISO_DISTRO" | tr '[:upper:]' '[:lower:]' | tr ' -' '__')
+            
+            # Build the menu entry for two-partition layout
+            entries+="# $ISO_DISTRO - $iso_name (Data Partition, Auto-detected)"$'\n'
+            entries+="menuentry \"$entry_title\" --class $class_name --class linux {"$'\n'
+            entries+="    # Set root to data partition where ISOs are stored"$'\n'
+            entries+="    set root='(hd0,$data_partition_ref)'"$'\n'
+            if [[ -n "$DATA_UUID" ]]; then
+                entries+="    search --no-floppy --fs-uuid --set=root $DATA_UUID"$'\n'
+            fi
+            entries+="    set isofile=\"/$iso_name\""$'\n'
+            entries+="    loopback loop \$isofile"$'\n'
+            
+            if [[ -n "$ISO_KERNEL" ]]; then
+                entries+="    linux (loop)$ISO_KERNEL $ISO_BOOT_PARAMS"$'\n'
+            else
+                entries+="    # ERROR: No kernel found for $iso_name!"$'\n'
+                print_warning "⚠ No kernel detected for $iso_name"
+            fi
+            
+            if [[ -n "$ISO_INITRD" ]]; then
+                entries+="    initrd (loop)$ISO_INITRD"$'\n'
+            else
+                entries+="    # WARNING: No initrd found for $iso_name"$'\n'
+                print_warning "⚠ No initrd detected for $iso_name"
+            fi
+            
+            entries+="}"$'\n'
+            entries+=""$'\n'
+            ((entries_count++))
+            print_success "✓ Added advanced entry for $ISO_DISTRO (two-partition)"
+            
+        else
+            print_warning "⚠ Could not detect boot files for $iso_name, creating generic entry..."
+            
+            # Fallback to generic entry for two-partition layout
+            entries+="# Generic entry for $iso_name (auto-detection failed, two-partition)"$'\n'
+            entries+="menuentry \"Linux ISO - $iso_name\" --class linux {"$'\n'
+            entries+="    # Set root to data partition where ISOs are stored"$'\n'
+            entries+="    set root='(hd0,$data_partition_ref)'"$'\n'
+            if [[ -n "$DATA_UUID" ]]; then
+                entries+="    search --no-floppy --fs-uuid --set=root $DATA_UUID"$'\n'
+            fi
+            entries+="    set isofile=\"/$iso_name\""$'\n'
+            entries+="    loopback loop \$isofile"$'\n'
+            entries+="    linux (loop)/casper/vmlinuz boot=casper iso-scan/filename=\${isofile} quiet splash"$'\n'
+            entries+="    initrd (loop)/casper/initrd"$'\n'
+            entries+="}"$'\n'
+            entries+=""$'\n'
+            ((entries_count++))
+            print_success "✓ Added generic entry (two-partition)"
+        fi
+    done
+    
+    if [[ $entries_count -gt 0 ]]; then
+        print_success "📝 Generated $entries_count advanced menu entries for two-partition layout"
+    else
+        print_warning "⚠ No advanced menu entries were created"
+    fi
+    
+    echo "$entries"
+}
+
+generate_menu_entries() {
+    print_info "Analyzing ISO files and generating menu entries for two-partition layout..."
+    
+    local data_mount_point="/mnt/multiboot_data"
+    local data_partition="${USB_DEVICE}2"
+    
+    # Mount the Data partition to find ISOs
+    sudo mkdir -p "$data_mount_point"
+    if ! sudo mount "$data_partition" "$data_mount_point"; then
+        print_error "Failed to mount Data partition for menu generation"
+        print_warning "Menu entries will need to be created manually later."
         return 0
     fi
     
-    print_info "Found ${#iso_files[@]} ISO file(s) on USB, generating menu entries..."
+    # Find ISO files on the Data partition
+    local iso_files=($(find "$data_mount_point" -maxdepth 1 -name "*.iso" -type f 2>/dev/null))
+    
+    if [[ ${#iso_files[@]} -eq 0 ]]; then
+        print_info "No ISO files found on Data partition. Menu entries can be configured manually later."
+        safe_umount "$data_mount_point"
+        sudo rmdir "$data_mount_point" 2>/dev/null || true
+        return 0
+    fi
+    
+    print_info "Found ${#iso_files[@]} ISO file(s) on Data partition, generating menu entries..."
+    
+    # Now mount the ESP to update its grub.cfg
+    local esp_mount_point="/mnt/multiboot_esp"
+    local esp_partition="${USB_DEVICE}1"
+    
+    sudo mkdir -p "$esp_mount_point"
+    if ! sudo mount "$esp_partition" "$esp_mount_point"; then
+        print_error "Failed to mount ESP for menu generation"
+        safe_umount "$data_mount_point"
+        sudo rmdir "$data_mount_point" 2>/dev/null || true
+        return 0
+    fi
     
     # Create a backup of the original config
-    if [[ -f "$mount_point/boot/grub/grub.cfg" ]]; then
-        sudo cp "$mount_point/boot/grub/grub.cfg" "$mount_point/boot/grub/grub.cfg.backup" 2>/dev/null || true
+    if [[ -f "$esp_mount_point/boot/grub/grub.cfg" ]]; then
+        sudo cp "$esp_mount_point/boot/grub/grub.cfg" "$esp_mount_point/boot/grub/grub.cfg.backup" 2>/dev/null || true
         
-        # Create custom entries file
+        # Create custom entries for two-partition layout
         local custom_entries=""
         
         if [[ "$ISO_DETECTION_AVAILABLE" == "true" ]]; then
             # Use advanced ISO detection
-            print_info "Using automatic kernel/initrd detection..."
-            custom_entries=$(generate_advanced_menu_entries_content "$mount_point" "${iso_files[@]}")
+            print_info "Using automatic kernel/initrd detection for two-partition layout..."
+            custom_entries=$(generate_advanced_menu_entries_content_two_partition "$data_mount_point" "${iso_files[@]}")
         else
-            # Use manual entries for common distributions
-            print_info "Using manual entries for common distributions..."
-            custom_entries=$(generate_manual_menu_entries_content "${iso_files[@]}")
+            # Use manual entries for common distributions with two-partition paths
+            print_info "Using manual entries for common distributions (two-partition layout)..."
+            custom_entries=$(generate_manual_menu_entries_content_two_partition "${iso_files[@]}")
         fi
         
         # Add custom entries to grub.cfg
@@ -1857,45 +2175,61 @@ generate_menu_entries() {
             {
                 echo ""
                 echo "#==============================================#"
-                echo "#          Custom ISO Menu Entries          #"
+                echo "#   Custom ISO Menu Entries (Two-Partition)  #"
+                echo "#   ISOs located on data partition           #"
                 echo "#==============================================#"
                 echo ""
                 echo "$custom_entries"
-            } | sudo tee -a "$mount_point/boot/grub/grub.cfg" > /dev/null
+            } | sudo tee -a "$esp_mount_point/boot/grub/grub.cfg" > /dev/null
             
-            print_success "✅ Menu entries added to GRUB configuration"
+            print_success "✅ Menu entries added to GRUB configuration (two-partition layout)"
         else
             print_warning "⚠ No menu entries were generated"
         fi
     else
-        print_warning "GRUB config file not found, skipping menu generation"
+        print_warning "GRUB config file not found on ESP, skipping menu generation"
     fi
     
-    # Unmount with error handling
-    safe_umount "$mount_point"
-    sudo rmdir "$mount_point" 2>/dev/null || true
+    # Unmount both partitions
+    safe_umount "$esp_mount_point"
+    sudo rmdir "$esp_mount_point" 2>/dev/null || true
     
-    print_success "Menu entry generation completed"
-    return 0  # Ensure successful return
+    safe_umount "$data_mount_point"
+    sudo rmdir "$data_mount_point" 2>/dev/null || true
+    
+    print_success "Menu entry generation completed for two-partition layout"
+    return 0
 }
 
-# Generate manual menu entries for common distributions (fallback method)
-generate_manual_menu_entries_content() {
+# Generate manual menu entries for common distributions (two-partition layout)
+generate_manual_menu_entries_content_two_partition() {
     local iso_files=("$@")
     local entries=""
     local entries_count=0
+    
+    # Determine correct partition reference based on partition table type
+    local data_partition_ref
+    if [[ "$PARTITION_TYPE" == "gpt" ]]; then
+        data_partition_ref="gpt2"
+    else
+        data_partition_ref="2"
+    fi
     
     for iso_path in "${iso_files[@]}"; do
         local iso_name=$(basename "$iso_path")
         local iso_lower=$(echo "$iso_name" | tr '[:upper:]' '[:lower:]')
         
-        print_info "📝 Creating manual entry for $iso_name..."
+        print_info "📝 Creating manual entry for $iso_name (two-partition layout)..."
         
         # Linux Mint entries
         if [[ "$iso_lower" == *"mint"* ]]; then
-            entries+="# Linux Mint - $iso_name"$'\n'
+            entries+="# Linux Mint - $iso_name (Data Partition)"$'\n'
             entries+="menuentry \"Linux Mint - $iso_name\" --class mint --class linux {"$'\n'
-            entries+="    set root='(hd0,$PARTITION_REF)'"$'\n'
+            entries+="    # Set root to data partition where ISOs are stored"$'\n'
+            entries+="    set root='(hd0,$data_partition_ref)'"$'\n'
+            if [[ -n "$DATA_UUID" ]]; then
+                entries+="    search --no-floppy --fs-uuid --set=root $DATA_UUID"$'\n'
+            fi
             entries+="    set isofile=\"/$iso_name\""$'\n'
             entries+="    loopback loop \$isofile"$'\n'
             entries+="    linux (loop)/casper/vmlinuz boot=casper iso-scan/filename=\${isofile} quiet splash vt.global_cursor_default=0 loglevel=2 rd.systemd.show_status=false rd.udev.log-priority=3 sysrq_always_enabled=1 cow_spacesize=1G"$'\n'
@@ -1903,13 +2237,17 @@ generate_manual_menu_entries_content() {
             entries+="}"$'\n'
             entries+=""$'\n'
             ((entries_count++))
-            print_success "✓ Added Linux Mint entry"
+            print_success "✓ Added Linux Mint entry (two-partition)"
             
         # Kubuntu entries  
         elif [[ "$iso_lower" == *"kubuntu"* ]]; then
-            entries+="# Kubuntu - $iso_name"$'\n'
+            entries+="# Kubuntu - $iso_name (Data Partition)"$'\n'
             entries+="menuentry \"Kubuntu - $iso_name\" --class kubuntu --class linux {"$'\n'
-            entries+="    set root='(hd0,$PARTITION_REF)'"$'\n'
+            entries+="    # Set root to data partition where ISOs are stored"$'\n'
+            entries+="    set root='(hd0,$data_partition_ref)'"$'\n'
+            if [[ -n "$DATA_UUID" ]]; then
+                entries+="    search --no-floppy --fs-uuid --set=root $DATA_UUID"$'\n'
+            fi
             entries+="    set isofile=\"/$iso_name\""$'\n'
             entries+="    loopback loop \$isofile"$'\n'
             entries+="    linux (loop)/casper/vmlinuz boot=casper iso-scan/filename=\${isofile} quiet splash"$'\n'
@@ -1917,13 +2255,17 @@ generate_manual_menu_entries_content() {
             entries+="}"$'\n'
             entries+=""$'\n'
             ((entries_count++))
-            print_success "✓ Added Kubuntu entry"
+            print_success "✓ Added Kubuntu entry (two-partition)"
             
         # Ubuntu entries
         elif [[ "$iso_lower" == *"ubuntu"* ]]; then
-            entries+="# Ubuntu - $iso_name"$'\n'
+            entries+="# Ubuntu - $iso_name (Data Partition)"$'\n'
             entries+="menuentry \"Ubuntu - $iso_name\" --class ubuntu --class linux {"$'\n'
-            entries+="    set root='(hd0,$PARTITION_REF)'"$'\n'
+            entries+="    # Set root to data partition where ISOs are stored"$'\n'
+            entries+="    set root='(hd0,$data_partition_ref)'"$'\n'
+            if [[ -n "$DATA_UUID" ]]; then
+                entries+="    search --no-floppy --fs-uuid --set=root $DATA_UUID"$'\n'
+            fi
             entries+="    set isofile=\"/$iso_name\""$'\n'
             entries+="    loopback loop \$isofile"$'\n'
             entries+="    linux (loop)/casper/vmlinuz boot=casper iso-scan/filename=\${isofile} quiet splash"$'\n'
@@ -1931,13 +2273,17 @@ generate_manual_menu_entries_content() {
             entries+="}"$'\n'
             entries+=""$'\n'
             ((entries_count++))
-            print_success "✓ Added Ubuntu entry"
+            print_success "✓ Added Ubuntu entry (two-partition)"
             
         # Generic entries for other ISOs
         else
-            entries+="# Generic Linux - $iso_name"$'\n'
+            entries+="# Generic Linux - $iso_name (Data Partition)"$'\n'
             entries+="menuentry \"Linux ISO - $iso_name\" --class linux {"$'\n'
-            entries+="    set root='(hd0,$PARTITION_REF)'"$'\n'
+            entries+="    # Set root to data partition where ISOs are stored"$'\n'
+            entries+="    set root='(hd0,$data_partition_ref)'"$'\n'
+            if [[ -n "$DATA_UUID" ]]; then
+                entries+="    search --no-floppy --fs-uuid --set=root $DATA_UUID"$'\n'
+            fi
             entries+="    set isofile=\"/$iso_name\""$'\n'
             entries+="    loopback loop \$isofile"$'\n'
             entries+="    linux (loop)/casper/vmlinuz boot=casper iso-scan/filename=\${isofile} quiet splash"$'\n'
@@ -1945,12 +2291,12 @@ generate_manual_menu_entries_content() {
             entries+="}"$'\n'
             entries+=""$'\n'
             ((entries_count++))
-            print_success "✓ Added generic entry"
+            print_success "✓ Added generic entry (two-partition)"
         fi
     done
     
     if [[ $entries_count -gt 0 ]]; then
-        print_success "📝 Generated $entries_count manual menu entries"
+        print_success "📝 Generated $entries_count manual menu entries for two-partition layout"
     else
         print_warning "⚠ No manual entries were created"
     fi
@@ -1968,11 +2314,14 @@ show_completion_info() {
     echo "  3. Select your USB device as the boot option"
     echo "  4. Choose your desired ISO from the GRUB menu"
     echo
-    print_info "USB Details:"
+    print_info "USB Details (Two-Partition Layout):"
     echo "  Device: $USB_DEVICE"
     echo "  Size: $USB_SIZE"
-    echo "  Filesystem: exFAT (supports files > 4GB)"
-    echo "  UUID: $USB_UUID"
+    echo "  Layout: Two-partition design for optimal compatibility"
+    echo "    ├── Partition 1 (ESP): 1GB FAT32 - GRUB bootloader and configuration"
+    echo "    └── Partition 2 (Data): Remaining space exFAT - ISO file storage"
+    echo "  ESP UUID: ${ESP_UUID:-not available}"
+    echo "  Data UUID: ${DATA_UUID:-not available}"
     echo "  Partition Table: $PARTITION_TYPE (auto-detected)"
     if [[ "$ISO_DETECTION_AVAILABLE" == "true" ]]; then
         echo "  ISO Detection: Enhanced (automatic kernel/initrd detection)"
@@ -1980,17 +2329,40 @@ show_completion_info() {
         echo "  ISO Detection: Basic (pattern matching)"
     fi
     echo
+    print_info "Partition Details:"
+    echo "  ESP (EFI System Partition):"
+    echo "    • Location: ${USB_DEVICE}1"
+    echo "    • Format: FAT32 (required for UEFI compatibility)"
+    echo "    • Contents: GRUB bootloader, themes, configuration files"
+    echo "    • Size: 1GB"
+    echo "  Data Partition:"
+    echo "    • Location: ${USB_DEVICE}2"
+    echo "    • Format: exFAT (supports files > 4GB)"
+    echo "    • Contents: ISO files, custom configurations"
+    echo "    • Size: Remaining USB space"
+    echo
     print_info "To add more ISOs later:"
-    echo "  1. Mount the USB drive"
-    echo "  2. Copy ISO files to the root directory (any size supported)"
-    echo "  3. Edit /boot/grub/grub.cfg to add menu entries"
+    echo "  1. Mount the Data partition (${USB_DEVICE}2)"
+    echo "  2. Copy ISO files to the root of the Data partition"
+    echo "  3. Optionally edit the ESP's /boot/grub/grub.cfg to add menu entries"
     if [[ "$ISO_DETECTION_AVAILABLE" == "true" ]]; then
         echo "  4. Or use: sudo ./analyze_iso.sh your_new_iso.iso"
     fi
     echo
-    print_info "ISO storage location: Root of USB drive"
-    print_info "Configuration backup: /boot/grub/grub.cfg.backup"
-    print_info "Technical note: GRUB configuration automatically adjusted for $PARTITION_TYPE partition table"
+    print_info "Key Locations:"
+    echo "  ISO storage: Root of Data partition (${USB_DEVICE}2)"
+    echo "  GRUB config: ESP/boot/grub/grub.cfg (${USB_DEVICE}1)"
+    echo "  Config backup: ESP/boot/grub/grub.cfg.backup (${USB_DEVICE}1)"
+    echo "  Boot files: ESP/EFI/BOOT/ (${USB_DEVICE}1)"
+    echo
+    print_info "Technical notes:"
+    echo "  • Two-partition design ensures maximum UEFI/BIOS compatibility"
+    echo "  • ESP uses FAT32 as required by UEFI specification"
+    echo "  • Data partition uses exFAT for large file support (>4GB ISOs)"
+    echo "  • GRUB automatically searches for ISOs on the Data partition"
+    echo "  • Configuration automatically adjusted for $PARTITION_TYPE partition table"
+    echo
+    print_success "Your multiboot USB is ready to use!"
 }
 
 # Main execution
@@ -2130,4 +2502,4 @@ main() {
 }
 
 # Run main function
-main "$@" 
+main "$@"
