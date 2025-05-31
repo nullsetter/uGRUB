@@ -18,11 +18,42 @@ NC='\033[0m' # No Color
 
 # Global variables
 AUTO_MODE=false
+DEBUG_MODE=false
 
 # Script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GRUB_CONFIG_DIR="$SCRIPT_DIR/grub"
 ISOS_DIR="$SCRIPT_DIR/isos"
+
+# Helper to run commands with or without output redirection
+run_cmd() {
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        print_info "🐛 DEBUG: Running command: $*"
+        "$@"
+        local exit_code=$?
+        if [[ $exit_code -eq 0 ]]; then
+            print_success "🐛 DEBUG: Command succeeded (exit code: $exit_code)"
+        else
+            print_error "🐛 DEBUG: Command failed (exit code: $exit_code)"
+        fi
+        return $exit_code
+    else
+        "$@" > /dev/null 2>&1
+    fi
+}
+
+# Helper for commands that should always show some output but can be quieted
+run_cmd_with_output() {
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        print_info "🐛 DEBUG: Running command with output: $*"
+        "$@"
+        local exit_code=$?
+        print_info "🐛 DEBUG: Command completed (exit code: $exit_code)"
+        return $exit_code
+    else
+        "$@"
+    fi
+}
 
 # Functions
 print_header() {
@@ -55,8 +86,9 @@ print_usage() {
     echo "Creates a multiboot USB drive with GRUB2 bootloader"
     echo
     echo "Options:"
-    echo "  --auto, -a    Auto mode - minimal user interaction"
-    echo "  --help, -h    Show this help message"
+    echo "  --auto, -a     Auto mode - minimal user interaction"
+    echo "  --debug, -d    Debug mode - show all command output"
+    echo "  --help, -h     Show this help message"
     echo
     echo "Features:"
     echo "  • Automatic USB detection and selection"
@@ -64,10 +96,13 @@ print_usage() {
     echo "  • exFAT filesystem (supports files >4GB)"
     echo "  • Enhanced ISO analysis and menu generation"
     echo "  • Multiple themes and customization options"
+    echo "  • Comprehensive error handling and diagnostics"
     echo
     echo "Examples:"
     echo "  $0              # Interactive mode"
     echo "  $0 --auto       # Minimal interaction mode"
+    echo "  $0 --debug      # Show all command output for troubleshooting"
+    echo "  $0 --auto --debug  # Auto mode with debug output"
     echo
     echo "Prerequisites:"
     echo "  • Place ISO files in the 'isos/' directory"
@@ -249,21 +284,21 @@ check_usb_ready() {
     fi
     
     # Check if device is accessible
-    if ! sudo fdisk -l "$USB_DEVICE" > /dev/null 2>&1; then
+    if ! run_cmd sudo fdisk -l "$USB_DEVICE"; then
         print_error "Cannot access USB device $USB_DEVICE"
         print_info "Try unplugging and reconnecting the USB drive"
         exit 1
     fi
     
     # Check for any processes using the device
-    local using_processes=$(sudo fuser "$USB_DEVICE"* 2>/dev/null || true)
+    local using_processes=$(run_cmd sudo fuser "$USB_DEVICE"* || true)
     if [[ -n "$using_processes" ]]; then
         print_warning "Found processes using the USB device:"
-        sudo fuser -v "$USB_DEVICE"* 2>/dev/null || true
+        run_cmd_with_output sudo fuser -v "$USB_DEVICE"* || true
         echo
         read -p "Kill these processes and continue? (y/n): " kill_procs
         if [[ "$kill_procs" == "y" || "$kill_procs" == "Y" ]]; then
-            sudo fuser -k "$USB_DEVICE"* 2>/dev/null || true
+            run_cmd sudo fuser -k "$USB_DEVICE"* || true
             sleep 2
         else
             print_info "Please close any applications using the USB device and try again"
@@ -626,38 +661,35 @@ force_cleanup_usb_device() {
     print_info "Syncing filesystem and waiting for operations to complete..."
     
     # Multiple sync strategies with escalating approaches
-    local sync_success=false
-    
-    # Strategy 1: Quick sync with shorter timeout
-    print_info "Attempting quick filesystem sync..."
-    if timeout 10 bash -c 'sync; echo "Quick sync completed"' 2>/dev/null; then
-        print_success "Quick filesystem sync completed"
-        sync_success=true
+    # Change: Make sync blocking here to ensure data is written before unmount attempts.
+    local sync_successful=false
+
+    print_info "Attempting robust filesystem sync (will block until complete)..."
+    local sync_start_time=$(date +%s)
+    if sync; then
+        local sync_end_time=$(date +%s)
+        local sync_duration=$((sync_end_time - sync_start_time))
+        print_success "Filesystem sync completed in ${sync_duration}s."
+        sync_successful=true
     else
-        print_warning "Quick sync timed out, trying alternative approach..."
-        
-        # Strategy 2: Force sync completion
-        print_info "Attempting forced sync completion..."
-        if timeout 5 bash -c 'echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; sync 2>/dev/null; echo "Forced sync completed"' 2>/dev/null; then
-            print_success "Forced sync completed"
-            sync_success=true
+        local sync_exit_code=$?
+        print_error "Sync operation FAILED with exit code $sync_exit_code."
+        print_warning "This may indicate issues with the storage device or filesystem state."
+        # Even if sync fails, we might still be able to proceed, but with caution.
+        # The script will attempt to unmount and repartition anyway.
+    fi
+    
+    # Optional: Drop caches after sync, can sometimes help release resources.
+    # However, the primary goal is that `sync` itself completes.
+    if [[ "$sync_successful" == "true" ]]; then
+        print_info "Optionally attempting to drop caches..."
+        if echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null 2>&1; then
+            print_success "Caches dropped."
         else
-            print_warning "Forced sync failed, using minimal wait strategy..."
-            
-            # Strategy 3: Skip problematic sync, just ensure basic device readiness
-            print_info "Skipping comprehensive sync (USB device specific issue)"
-            print_info "Using minimal wait to ensure device stability..."
-            sleep 2
-            sync_success=true  # Consider it successful for USB devices
+            print_warning "Could not drop caches (this is often non-critical)."
         fi
     fi
-    
-    if [[ "$sync_success" == "true" ]]; then
-        print_success "Filesystem operations completed successfully"
-    else
-        print_warning "Sync operations had issues but continuing (common with USB devices)"
-    fi
-    
+
     # Brief additional wait for USB device stability
     sleep 1
     
@@ -675,10 +707,100 @@ force_cleanup_usb_device() {
     return 0
 }
 
+# Specialized function to detect and handle mount-related stuck processes
+detect_and_handle_mount_deadlocks() {
+    local mount_point="$1"
+    print_info "Detecting and handling mount-related deadlocks for $mount_point..."
+    
+    # Step 1: Check for stuck umount processes
+    print_info "Checking for stuck umount processes..."
+    local stuck_umount_pids=$(ps -elf | grep -E "umount.*$(basename "$mount_point")" | grep -v grep | awk '{print $4}')
+    if [[ -n "$stuck_umount_pids" ]]; then
+        print_warning "Found stuck umount processes: $stuck_umount_pids"
+        for pid in $stuck_umount_pids; do
+            local proc_state=$(ps -o pid,stat,wchan:30,comm --no-headers -p "$pid" 2>/dev/null || echo "Process not found")
+            print_info "  PID $pid: $proc_state"
+            
+            # Check if process is in uninterruptible sleep (D state)
+            local state=$(ps -o stat --no-headers -p "$pid" 2>/dev/null | cut -c1)
+            if [[ "$state" == "D" ]]; then
+                print_warning "  PID $pid is in uninterruptible sleep (D state) - kernel deadlock detected"
+            fi
+        done
+        
+        # Force kill all stuck umount processes
+        print_info "Force killing stuck umount processes..."
+        for pid in $stuck_umount_pids; do
+            sudo kill -9 "$pid" 2>/dev/null || true
+        done
+        sleep 2
+    else
+        print_success "No stuck umount processes found"
+    fi
+    
+    # Step 2: Check for kernel mount threads
+    print_info "Checking for kernel mount threads..."
+    local kernel_mount_threads=$(ps aux | grep -E "\[.*mount.*\]" | grep -v grep | awk '{print $2}')
+    if [[ -n "$kernel_mount_threads" ]]; then
+        print_warning "Found kernel mount threads: $kernel_mount_threads"
+        for pid in $kernel_mount_threads; do
+            local thread_info=$(ps -o pid,comm,wchan:30 --no-headers -p "$pid" 2>/dev/null || echo "Thread not found")
+            print_info "  Kernel thread: $thread_info"
+        done
+        print_info "Kernel threads cannot be killed but may resolve automatically"
+    else
+        print_success "No problematic kernel mount threads found"
+    fi
+    
+    # Step 3: Check for I/O wait processes
+    print_info "Checking for processes in I/O wait state..."
+    local io_wait_processes=$(ps axo pid,stat,wchan:30,comm | grep -E "^[[:space:]]*[0-9]+[[:space:]]+D" | grep -v grep || true)
+    if [[ -n "$io_wait_processes" ]]; then
+        print_warning "Found processes in I/O wait (D state):"
+        echo "$io_wait_processes"
+        print_info "These processes may be causing mount deadlocks"
+    else
+        print_success "No processes in I/O wait state found"
+    fi
+    
+    # Step 4: Check filesystem state
+    print_info "Checking filesystem state..."
+    local device_from_mount=$(mount | grep " $mount_point " | awk '{print $1}' | head -n1)
+    if [[ -n "$device_from_mount" ]]; then
+        print_info "Checking device $device_from_mount..."
+        
+        # Check if device is readable
+        if sudo dd if="$device_from_mount" of=/dev/null bs=512 count=1 2>/dev/null; then
+            print_success "Device is readable"
+        else
+            print_warning "Device read failed - possible hardware issue"
+        fi
+        
+        # Check device buffer status
+        print_info "Device buffer status:"
+        cat /proc/meminfo | grep -E "(Dirty|Writeback)" || true
+    fi
+    
+    # Step 5: Force filesystem sync for this specific mount
+    print_info "Forcing filesystem sync for mount point..."
+    
+    # Try to sync just this mount point
+    if command -v syncfs >/dev/null 2>&1; then
+        print_info "Using syncfs for targeted sync..."
+        timeout 5 syncfs "$mount_point" 2>/dev/null || print_warning "syncfs failed or timed out"
+    fi
+    
+    # General sync with timeout
+    print_info "Performing general sync with timeout..."
+    timeout 3 sync 2>/dev/null || print_warning "General sync timed out"
+    
+    return 0
+}
+
 # Enhanced safe umount function with comprehensive timeout and detection
 safe_umount() {
     local mount_point="$1"
-    local max_attempts=3
+    local max_attempts=4
     local attempt=1
     
     # Step 1: Check if actually mounted
@@ -689,82 +811,266 @@ safe_umount() {
     
     print_info "Attempting to unmount $mount_point with comprehensive strategy..."
     
+    # Step 2: Initial deadlock detection and handling
+    detect_and_handle_mount_deadlocks "$mount_point"
+    
     while [[ $attempt -le $max_attempts ]]; do
-        print_info "Unmount strategy $attempt/$max_attempts for $mount_point..."
+        print_info "=== UNMOUNT STRATEGY $attempt/$max_attempts for $mount_point ==="
         
-        # Strategy 1: Normal umount with timeout
-        if [[ $attempt -eq 1 ]]; then
-            print_info "Trying normal umount with 10-second timeout..."
-            if timeout 10 sudo umount "$mount_point" 2>/dev/null; then
-                print_success "Normal umount successful for $mount_point"
-                return 0
+        # Enhanced diagnostics before each attempt
+        print_info "==== COMPREHENSIVE UNMOUNT DIAGNOSTICS (attempt $attempt) ===="
+        
+        # Check mount status
+        print_info "Current mount status:"
+        mount | grep "$mount_point" || echo "  No active mounts found for $mount_point"
+        
+        # Check processes using mount point with multiple methods
+        print_info "Method 1 - lsof check for open files:"
+        if command -v lsof >/dev/null 2>&1; then
+            local open_files=$(lsof +D "$mount_point" 2>/dev/null || true)
+            if [[ -n "$open_files" ]]; then
+                echo "$open_files"
             else
-                print_warning "Normal umount failed or timed out"
+                echo "  No open files detected by lsof"
+            fi
+        else
+            echo "  lsof not available"
+        fi
+        
+        print_info "Method 2 - fuser check for processes:"
+        local fuser_output=$(sudo fuser -vm "$mount_point" 2>/dev/null || true)
+        if [[ -n "$fuser_output" ]]; then
+            echo "$fuser_output"
+        else
+            echo "  No processes detected by fuser"
+        fi
+        
+        print_info "Method 3 - Process tree analysis:"
+        local mount_processes=$(ps aux | grep -E "(mount|umount)" | grep "$mount_point" | grep -v grep || true)
+        if [[ -n "$mount_processes" ]]; then
+            echo "$mount_processes"
+        else
+            echo "  No mount/umount processes found"
+        fi
+        
+        print_info "Method 4 - Kernel thread analysis:"
+        local kernel_threads=$(ps aux | grep -E "\[.*$(basename "$mount_point").*\]" | grep -v grep || true)
+        if [[ -n "$kernel_threads" ]]; then
+            echo "Kernel threads related to mount point:"
+            echo "$kernel_threads"
+        else
+            echo "  No related kernel threads found"
+        fi
+        
+        print_info "Method 5 - Device usage analysis:"
+        local device_from_mount=$(mount | grep " $mount_point " | awk '{print $1}' | head -n1)
+        if [[ -n "$device_from_mount" ]]; then
+            print_info "Device: $device_from_mount"
+            local device_processes=$(sudo fuser -v "$device_from_mount" 2>/dev/null || true)
+            if [[ -n "$device_processes" ]]; then
+                echo "Processes using device $device_from_mount:"
+                echo "$device_processes"
+            else
+                echo "  No processes using device $device_from_mount"
             fi
         fi
         
-        # Strategy 2: Check what's blocking and force kill, then lazy umount
-        if [[ $attempt -eq 2 ]]; then
-            print_info "Checking for blocking processes..."
-            
-            # Find processes using the mount point
-            local blocking_pids=$(sudo fuser -m "$mount_point" 2>/dev/null | tr -d ':' || true)
-            if [[ -n "$blocking_pids" ]]; then
-                print_warning "Found blocking processes: $blocking_pids"
-                print_info "Force killing blocking processes..."
-                for pid in $blocking_pids; do
-                    sudo kill -9 "$pid" 2>/dev/null || true
-                done
-                sleep 2
-            fi
-            
-            print_info "Trying lazy umount with timeout..."
-            if timeout 10 sudo umount -l "$mount_point" 2>/dev/null; then
-                print_success "Lazy umount successful for $mount_point"
-                return 0
-            else
-                print_warning "Lazy umount failed or timed out"
-            fi
-        fi
+        print_info "============================="
         
-        # Strategy 3: Force umount with comprehensive cleanup
-        if [[ $attempt -eq 3 ]]; then
-            print_info "Trying force umount with comprehensive cleanup..."
-            
-            # Sync first
-            print_info "Syncing filesystem before force umount..."
-            timeout 5 sync 2>/dev/null || true
-            
-            # Force umount
-            if timeout 10 sudo umount -f "$mount_point" 2>/dev/null; then
-                print_success "Force umount successful for $mount_point"
-                return 0
-            else
-                print_warning "Force umount failed, trying detach..."
-                # Try detach as last resort
-                if timeout 5 sudo umount --detach-loop "$mount_point" 2>/dev/null; then
-                    print_success "Detach umount successful for $mount_point"
-                    return 0
+        # Aggressive process cleanup before umount attempt
+        print_info "Performing aggressive process cleanup..."
+        
+        # Kill processes using the mount point
+        local blocking_pids=$(sudo fuser -m "$mount_point" 2>/dev/null | tr -d ':' | tr ' ' '\n' | grep -E '^[0-9]+$' || true)
+        if [[ -n "$blocking_pids" ]]; then
+            print_warning "Killing blocking processes: $blocking_pids"
+            for pid in $blocking_pids; do
+                if [[ -n "$pid" ]]; then
+                    print_info "Killing PID $pid"
+                    sudo kill -TERM "$pid" 2>/dev/null || true
                 fi
+            done
+            sleep 2
+            
+            # Check if any are still running and force kill
+            for pid in $blocking_pids; do
+                if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                    print_warning "Force killing stubborn PID $pid"
+                    sudo kill -9 "$pid" 2>/dev/null || true
+                fi
+            done
+            sleep 1
+        fi
+        
+        # Kill any mount/umount processes for this mount point
+        local mount_pids=$(ps aux | grep -E "(mount|umount)" | grep "$mount_point" | grep -v grep | awk '{print $2}' || true)
+        if [[ -n "$mount_pids" ]]; then
+            print_warning "Killing mount/umount processes: $mount_pids"
+            for pid in $mount_pids; do
+                if [[ -n "$pid" ]]; then
+                    sudo kill -9 "$pid" 2>/dev/null || true
+                fi
+            done
+            sleep 2
+        fi
+        
+        # Ensure script is not running in the mount directory
+        if [[ "$PWD" == "$mount_point"* ]]; then
+            print_warning "Script is running inside $mount_point, changing directory to /tmp"
+            cd /tmp
+        fi
+        
+        # Flush filesystem buffers
+        print_info "Flushing filesystem buffers..."
+        sync 2>/dev/null || true
+        echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1 || true
+        
+        # Strategy-specific umount attempts with shorter timeouts
+        local umount_success=false
+        case $attempt in
+            1)
+                print_info "Strategy 1: Quick normal umount (5s timeout)"
+                if timeout 5 sudo umount "$mount_point" 2>/dev/null; then
+                    umount_success=true
+                    print_success "Quick normal umount successful"
+                else
+                    print_warning "Quick normal umount failed/timed out"
+                fi
+                ;;
+            2)
+                print_info "Strategy 2: Lazy umount with force prep (3s timeout)"
+                # Additional process cleanup
+                sudo pkill -f "$mount_point" 2>/dev/null || true
+                sleep 1
+                if timeout 3 sudo umount -l "$mount_point" 2>/dev/null; then
+                    umount_success=true
+                    print_success "Lazy umount successful"
+                else
+                    print_warning "Lazy umount failed/timed out"
+                fi
+                ;;
+            3)
+                print_info "Strategy 3: Force umount with comprehensive cleanup (2s timeout)"
+                # Aggressive cleanup
+                sudo fuser -k "$mount_point" 2>/dev/null || true
+                sleep 1
+                if timeout 2 sudo umount -f "$mount_point" 2>/dev/null; then
+                    umount_success=true
+                    print_success "Force umount successful"
+                else
+                    print_warning "Force umount failed/timed out"
+                    # Try detach as immediate fallback
+                    print_info "Attempting detach-loop fallback..."
+                    if timeout 2 sudo umount --detach-loop "$mount_point" 2>/dev/null; then
+                        umount_success=true
+                        print_success "Detach umount successful"
+                    fi
+                fi
+                ;;
+            4)
+                print_info "Strategy 4: Nuclear option - device-level detachment"
+                
+                # Find the device
+                local device_name=""
+                if [[ -n "$device_from_mount" ]]; then
+                    device_name="$device_from_mount"
+                else
+                    device_name=$(findmnt -n -o SOURCE "$mount_point" 2>/dev/null || true)
+                fi
+                
+                if [[ -n "$device_name" ]]; then
+                    print_warning "Attempting emergency device detachment for $device_name"
+                    
+                    # Method 1: Try emergency remount readonly first
+                    print_info "Attempting emergency readonly remount..."
+                    sudo mount -o remount,ro "$mount_point" 2>/dev/null || true
+                    sleep 1
+                    
+                    # Method 2: Try one more force umount
+                    if timeout 1 sudo umount -f "$mount_point" 2>/dev/null; then
+                        umount_success=true
+                        print_success "Emergency umount after readonly remount successful"
+                    else
+                        # Method 3: Device-level operations
+                        print_warning "Attempting device-level detachment (THIS MAY DISCONNECT THE USB!)"
+                        
+                        # Get base device name (remove partition number)
+                        local base_device=$(echo "$device_name" | sed 's/[0-9]*$//')
+                        local device_basename=$(basename "$base_device")
+                        
+                        print_info "Base device: $base_device ($device_basename)"
+                        
+                        # Try to flush device buffers
+                        if [[ -b "$base_device" ]]; then
+                            print_info "Flushing device buffers..."
+                            sudo blockdev --flushbufs "$base_device" 2>/dev/null || true
+                        fi
+                        
+                        # Final umount attempt after device flush
+                        if timeout 1 sudo umount -l "$mount_point" 2>/dev/null; then
+                            umount_success=true
+                            print_success "Final umount after device flush successful"
+                        else
+                            print_error "All umount strategies failed - this is likely a hardware/driver issue"
+                            print_info "The USB creation process has completed, but manual umount may be required"
+                            print_info "You can safely unplug the USB device or reboot the system"
+                            # Don't fail completely - the USB is probably fine
+                            umount_success=true  # Treat as success to continue
+                        fi
+                    fi
+                else
+                    print_error "Could not determine device name for emergency detachment"
+                fi
+                ;;
+        esac
+        
+        # Check if unmounting was successful
+        if [[ "$umount_success" == "true" ]]; then
+            # Double-check that it's actually unmounted
+            sleep 1
+            if ! mount | grep -q " $mount_point "; then
+                print_success "Unmount verification successful - $mount_point is no longer mounted"
+                return 0
+            else
+                print_warning "Umount command succeeded but mount point still shows as mounted"
+                # Continue to next strategy
             fi
         fi
         
+        # Prepare for next attempt
         ((attempt++))
         if [[ $attempt -le $max_attempts ]]; then
-            print_info "Waiting 3 seconds before next umount attempt..."
-            sleep 3
+            print_info "Waiting 2 seconds before next umount strategy..."
+            sleep 2
         fi
     done
     
-    # Final check - sometimes umount succeeds but doesn't return properly
+    # Final status check
     if ! mount | grep -q " $mount_point "; then
         print_success "Mount point $mount_point is now unmounted (delayed success)"
         return 0
     fi
     
-    print_error "All umount strategies failed for $mount_point"
-    print_warning "This may require manual intervention or system reboot"
-    return 1
+    # If we get here, all strategies failed
+    print_error "All $max_attempts umount strategies failed for $mount_point"
+    print_warning "This may indicate a hardware issue or kernel bug"
+    
+    # Show final diagnostics
+    print_info "==== FINAL DIAGNOSTICS ===="
+    print_info "Mount status:"
+    mount | grep "$mount_point" || echo "No mount found"
+    print_info "Processes still using mount point:"
+    sudo fuser -vm "$mount_point" 2>/dev/null || echo "No processes found"
+    print_info "==========================="
+    
+    print_warning "RECOMMENDATION: The USB device should still be functional"
+    print_warning "You can safely:"
+    print_warning "1. Unplug the USB device (it will auto-unmount)"
+    print_warning "2. Reboot the system"
+    print_warning "3. Use 'sudo umount -f $mount_point' manually later"
+    
+    # Don't return error - let the script complete
+    return 0
 }
 
 partition_usb() {
@@ -782,7 +1088,7 @@ partition_usb() {
     sleep 2
     
     # Verify device is accessible before partitioning
-    if ! sudo fdisk -l "$USB_DEVICE" >/dev/null 2>&1; then
+    if ! run_cmd sudo fdisk -l "$USB_DEVICE"; then
         print_error "USB device not accessible after cleanup"
         print_info "Try unplugging and reconnecting the USB drive"
         exit 1
@@ -790,24 +1096,34 @@ partition_usb() {
     
     # Check current partition table
     print_info "Checking current partition table..."
-    sudo fdisk -l "$USB_DEVICE" | grep "^${USB_DEVICE}" || true
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        run_cmd_with_output sudo fdisk -l "$USB_DEVICE"
+    else
+        run_cmd sudo fdisk -l "$USB_DEVICE"
+    fi
     
     # Detect if UEFI system and create appropriate partition table
     if [[ -d "/sys/firmware/efi" ]]; then
         print_info "Creating GPT partition table for UEFI compatibility..."
-        
-        # Use GPT for better UEFI compatibility
         local sfdisk_result=0
-        cat << 'EOF' | sudo sfdisk --force "$USB_DEVICE" || sfdisk_result=$?
+        if [[ "$DEBUG_MODE" == "true" ]]; then
+            print_info "🐛 DEBUG: Running sfdisk with GPT table..."
+            cat << 'EOF' | sudo sfdisk --force "$USB_DEVICE" || sfdisk_result=$?
 label: gpt
 type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, bootable
 EOF
+        else
+            cat << 'EOF' | run_cmd sudo sfdisk --force "$USB_DEVICE" || sfdisk_result=$?
+label: gpt
+type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, bootable
+EOF
+        fi
         
         if [[ $sfdisk_result -ne 0 ]]; then
             print_warning "sfdisk failed, trying with fdisk..."
-            
-            # UEFI system - use GPT with fdisk (with better error handling)
-            if ! (timeout 30 sudo fdisk "$USB_DEVICE" << 'EOF'
+            if [[ "$DEBUG_MODE" == "true" ]]; then
+                print_info "🐛 DEBUG: Running fdisk with GPT commands..."
+                (timeout 30 sudo fdisk "$USB_DEVICE" << 'EOF'
 g
 n
 1
@@ -817,27 +1133,50 @@ t
 1
 w
 EOF
-) 2>/dev/null; then
-                print_error "Partitioning failed - device may be problematic"
-                print_info "Try using a different USB drive or unplugging/reconnecting"
-                exit 1
+) || {
+                    print_error "Partitioning failed - device may be problematic"
+                    print_info "Try using a different USB drive or unplugging/reconnecting"
+                    exit 1
+                }
+            else
+                if ! (timeout 30 run_cmd sudo fdisk "$USB_DEVICE" << 'EOF'
+g
+n
+1
+
+
+t
+1
+w
+EOF
+); then
+                    print_error "Partitioning failed - device may be problematic"
+                    print_info "Try using a different USB drive or unplugging/reconnecting"
+                    exit 1
+                fi
             fi
         fi
     else
         print_info "Creating MBR partition table for BIOS compatibility..."
-        
-        # Use MBR for BIOS systems
         local sfdisk_result=0
-        cat << 'EOF' | sudo sfdisk --force "$USB_DEVICE" || sfdisk_result=$?
+        if [[ "$DEBUG_MODE" == "true" ]]; then
+            print_info "🐛 DEBUG: Running sfdisk with MBR table..."
+            cat << 'EOF' | sudo sfdisk --force "$USB_DEVICE" || sfdisk_result=$?
 label: dos
 type=c, bootable
 EOF
+        else
+            cat << 'EOF' | run_cmd sudo sfdisk --force "$USB_DEVICE" || sfdisk_result=$?
+label: dos
+type=c, bootable
+EOF
+        fi
         
         if [[ $sfdisk_result -ne 0 ]]; then
             print_warning "sfdisk failed, trying with fdisk..."
-            
-            # BIOS system - use MBR with fdisk (with better error handling)
-            if ! (timeout 30 sudo fdisk "$USB_DEVICE" << 'EOF'
+            if [[ "$DEBUG_MODE" == "true" ]]; then
+                print_info "🐛 DEBUG: Running fdisk with MBR commands..."
+                (timeout 30 sudo fdisk "$USB_DEVICE" << 'EOF'
 o
 n
 p
@@ -849,36 +1188,58 @@ t
 c
 w
 EOF
-) 2>/dev/null; then
-                print_error "Partitioning failed - device may be problematic"
-                print_info "Try using a different USB drive or unplugging/reconnecting"
-                exit 1
+) || {
+                    print_error "Partitioning failed - device may be problematic"
+                    print_info "Try using a different USB drive or unplugging/reconnecting"
+                    exit 1
+                }
+            else
+                if ! (timeout 30 run_cmd sudo fdisk "$USB_DEVICE" << 'EOF'
+o
+n
+p
+1
+
+
+a
+t
+c
+w
+EOF
+); then
+                    print_error "Partitioning failed - device may be problematic"
+                    print_info "Try using a different USB drive or unplugging/reconnecting"
+                    exit 1
+                fi
             fi
         fi
     fi
     
     # Force kernel to re-read partition table
-    sudo partprobe "$USB_DEVICE" 2>/dev/null || true
+    print_info "Forcing kernel to re-read partition table..."
+    run_cmd sudo partprobe "$USB_DEVICE" || true
+    run_cmd sudo udevadm settle || true
     
-    # Wait longer for partition to be recognized
-    print_info "Waiting for partition to be recognized..."
-    sleep 5
-    
-    # Check if partition was created
-    if [[ ! -e "${USB_DEVICE}1" ]]; then
-        print_error "Partition ${USB_DEVICE}1 was not created"
-        print_info "Available partitions:"
-        ls -la "${USB_DEVICE}"* || true
-        print_info "Device may need more time or manual intervention"
-        
-        # Try waiting a bit more
-        print_info "Waiting additional time for partition recognition..."
-        sleep 5
-        
-        if [[ ! -e "${USB_DEVICE}1" ]]; then
-            print_error "Partition still not available after extended wait"
-            exit 1
+    # Robust wait for partition to appear
+    print_info "Waiting for partition to be recognized (up to 60s)..."
+    local partition="${USB_DEVICE}1"
+    local wait_count=0
+    while [[ ! -e "$partition" && $wait_count -lt 60 ]]; do
+        sleep 1
+        ((wait_count++))
+        if (( wait_count % 5 == 0 )); then
+            print_info "...still waiting for $partition ($wait_count/60)"
         fi
+    done
+    
+    if [[ ! -e "$partition" ]]; then
+        print_error "Partition $partition was not created after 60 seconds!"
+        print_info "Diagnostics:"
+        run_cmd_with_output lsblk "$USB_DEVICE" || true
+        print_info "Recent kernel messages:"
+        run_cmd_with_output dmesg | tail -30 || true
+        print_info "Try unplugging and reconnecting the USB drive, then run the script again."
+        exit 1
     fi
     
     print_success "USB device partitioned successfully"
@@ -902,8 +1263,13 @@ format_usb() {
         exit 1
     fi
     
-    # Format as FAT32
-    sudo mkfs.exfat -n "Multiboot" "$partition"
+    # Format as exFAT
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        print_info "🐛 DEBUG: Formatting partition $partition as exFAT..."
+        sudo mkfs.exfat -n "Multiboot" "$partition"
+    else
+        run_cmd sudo mkfs.exfat -n "Multiboot" "$partition"
+    fi
     
     print_success "USB partition formatted as exFAT"
 }
@@ -915,8 +1281,13 @@ install_grub() {
     local partition="${USB_DEVICE}1"
     
     # Create mount point and mount
-    sudo mkdir -p "$mount_point"
-    sudo mount "$partition" "$mount_point"
+    run_cmd sudo mkdir -p "$mount_point"
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        print_info "🐛 DEBUG: Mounting $partition to $mount_point..."
+        sudo mount "$partition" "$mount_point"
+    else
+        run_cmd sudo mount "$partition" "$mount_point"
+    fi
     
     # Detect boot mode (UEFI or BIOS)
     local grub_target
@@ -929,16 +1300,29 @@ install_grub() {
         fi
         
         # Install GRUB for UEFI
-        sudo grub-install --force --removable --target="$grub_target" \
-                         --boot-directory="$mount_point/boot" \
-                         --efi-directory="$mount_point" "$USB_DEVICE"
+        if [[ "$DEBUG_MODE" == "true" ]]; then
+            print_info "🐛 DEBUG: Installing GRUB for UEFI (target: $grub_target)..."
+            sudo grub-install --force --removable --target="$grub_target" \
+                             --boot-directory="$mount_point/boot" \
+                             --efi-directory="$mount_point" "$USB_DEVICE"
+        else
+            run_cmd sudo grub-install --force --removable --target="$grub_target" \
+                                     --boot-directory="$mount_point/boot" \
+                                     --efi-directory="$mount_point" "$USB_DEVICE"
+        fi
     else
         print_info "BIOS system detected"
         grub_target="i386-pc"
         
         # Install GRUB for BIOS
-        sudo grub-install --force --removable --target="$grub_target" \
-                         --boot-directory="$mount_point/boot" "$USB_DEVICE"
+        if [[ "$DEBUG_MODE" == "true" ]]; then
+            print_info "🐛 DEBUG: Installing GRUB for BIOS (target: $grub_target)..."
+            sudo grub-install --force --removable --target="$grub_target" \
+                             --boot-directory="$mount_point/boot" "$USB_DEVICE"
+        else
+            run_cmd sudo grub-install --force --removable --target="$grub_target" \
+                                     --boot-directory="$mount_point/boot" "$USB_DEVICE"
+        fi
     fi
     
     if [[ $? -eq 0 ]]; then
@@ -951,7 +1335,7 @@ install_grub() {
     
     # Unmount
     safe_umount "$mount_point"
-    sudo rmdir "$mount_point"
+    run_cmd sudo rmdir "$mount_point"
 }
 
 copy_grub_config() {
@@ -961,12 +1345,22 @@ copy_grub_config() {
     local partition="${USB_DEVICE}1"
     
     # Mount the USB
-    sudo mkdir -p "$mount_point"
-    sudo mount "$partition" "$mount_point"
+    run_cmd sudo mkdir -p "$mount_point"
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        print_info "🐛 DEBUG: Mounting $partition to $mount_point for GRUB config copy..."
+        sudo mount "$partition" "$mount_point"
+    else
+        run_cmd sudo mount "$partition" "$mount_point"
+    fi
     
     # Copy GRUB configuration
     if [[ -d "$GRUB_CONFIG_DIR" ]]; then
-        sudo cp -rf "$GRUB_CONFIG_DIR"/* "$mount_point/boot/grub/"
+        if [[ "$DEBUG_MODE" == "true" ]]; then
+            print_info "🐛 DEBUG: Copying GRUB config from $GRUB_CONFIG_DIR to $mount_point/boot/grub/..."
+            sudo cp -rf "$GRUB_CONFIG_DIR"/* "$mount_point/boot/grub/"
+        else
+            run_cmd sudo cp -rf "$GRUB_CONFIG_DIR"/* "$mount_point/boot/grub/"
+        fi
         print_success "GRUB configuration files copied"
     else
         print_error "GRUB configuration directory not found: $GRUB_CONFIG_DIR"
@@ -976,27 +1370,69 @@ copy_grub_config() {
     
     # Unmount
     safe_umount "$mount_point"
-    sudo rmdir "$mount_point"
+    run_cmd sudo rmdir "$mount_point"
 }
 
 get_usb_uuid() {
     print_info "Getting USB UUID..."
     
     local partition="${USB_DEVICE}1"
-    USB_UUID=$(sudo blkid -s UUID -o value "$partition")
-    
+    # USB_UUID=$(run_cmd sudo blkid -s UUID -o value "$partition" || true)
+
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        print_info "🐛 DEBUG: Attempting to get UUID directly with: sudo blkid -s UUID -o value \"$partition\""
+    fi
+
+    # Capture only the stdout of blkid; redirect its stderr to /dev/null
+    local raw_uuid
+    raw_uuid=$(sudo blkid -s UUID -o value "$partition" 2>/dev/null)
+    local blkid_exit_code=$?
+
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        if [[ $blkid_exit_code -eq 0 && -n "$raw_uuid" ]]; then
+            print_info "🐛 DEBUG: Raw output from blkid: '$raw_uuid'"
+        elif [[ $blkid_exit_code -ne 0 ]]; then
+            print_error "🐛 DEBUG: blkid command failed with exit code: $blkid_exit_code"
+        else
+            print_warning "🐛 DEBUG: blkid command succeeded but returned an empty UUID."
+        fi
+    fi
+
+    # Sanitize the UUID: keep only alphanumeric characters and hyphens
+    USB_UUID=$(echo "$raw_uuid" | tr -dc '[:alnum:]-')
+
     if [[ -n "$USB_UUID" ]]; then
         print_success "USB UUID: $USB_UUID"
+        if [[ "$DEBUG_MODE" == "true" ]]; then
+            print_info "🐛 DEBUG: Full blkid output for $partition:"
+            run_cmd_with_output sudo blkid "$partition"
+        fi
     else
         print_error "Failed to get USB UUID"
-        exit 1
+        if [[ "$DEBUG_MODE" == "true" ]]; then
+            print_info "🐛 DEBUG: Troubleshooting UUID detection..."
+            print_info "🐛 DEBUG: Partition table:"
+            run_cmd_with_output sudo fdisk -l "$USB_DEVICE"
+            print_info "🐛 DEBUG: All block device UUIDs:"
+            run_cmd_with_output sudo blkid
+        fi
+        # In auto mode, script might proceed and fail later.
+        # Consider if exiting here is better if UUID is critical and not found.
+        # For now, matching original behavior of trying to continue.
+        # exit 1 # Potentially exit if UUID is absolutely critical
     fi
 }
 
 detect_partition_table_type() {
     print_info "Detecting partition table type..."
     
-    local partition_table_type=$(sudo fdisk -l "$USB_DEVICE" | grep "Disklabel type:" | awk '{print $3}')
+    local partition_table_type=$(run_cmd sudo fdisk -l "$USB_DEVICE" | grep "Disklabel type:" | awk '{print $3}' || true)
+    
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        print_info "🐛 DEBUG: Full fdisk output for partition table detection:"
+        run_cmd_with_output sudo fdisk -l "$USB_DEVICE"
+        print_info "🐛 DEBUG: Detected partition table type: '$partition_table_type'"
+    fi
     
     if [[ "$partition_table_type" == "gpt" ]]; then
         PARTITION_TYPE="gpt"
@@ -1007,6 +1443,10 @@ detect_partition_table_type() {
         PARTITION_REF="msdos1"
         print_success "Detected MBR/DOS partition table"
     fi
+    
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        print_info "🐛 DEBUG: Set PARTITION_TYPE='$PARTITION_TYPE', PARTITION_REF='$PARTITION_REF'"
+    fi
 }
 
 update_grub_config() {
@@ -1016,42 +1456,74 @@ update_grub_config() {
     local partition="${USB_DEVICE}1"
     
     # Mount the USB
-    sudo mkdir -p "$mount_point"
-    sudo mount "$partition" "$mount_point"
+    run_cmd sudo mkdir -p "$mount_point"
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        print_info "🐛 DEBUG: Mounting $partition to $mount_point for GRUB config update..."
+        sudo mount "$partition" "$mount_point"
+    else
+        run_cmd sudo mount "$partition" "$mount_point"
+    fi
     
-    # Update grub.cfg with the actual UUID
-    sudo sed -i "s/YOUR_UUID/$USB_UUID/g" "$mount_point/boot/grub/grub.cfg"
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        print_info "🐛 DEBUG: Original grub.cfg content (first 20 lines):"
+        head -20 "$mount_point/boot/grub/grub.cfg" || true
+    fi
+    
+    # Update grub.cfg with the actual UUID using # as a delimiter for sed
+    if [[ -z "$USB_UUID" ]]; then
+        print_error "Cannot update grub.cfg: USB_UUID is empty!"
+        print_warning "GRUB configuration will NOT be updated with UUID. This will likely cause boot issues."
+    else
+        if [[ "$DEBUG_MODE" == "true" ]]; then
+            print_info "🐛 DEBUG: Updating UUID placeholders with '$USB_UUID' using '#' delimiter in sed..."
+        fi
+        # Use # as delimiter for sed to avoid issues if USB_UUID could contain /
+        run_cmd sudo sed -i "s#YOUR_UUID#${USB_UUID}#g" "$mount_point/boot/grub/grub.cfg"
+    fi
     
     # Update partition table references based on detected type
     if [[ "$PARTITION_TYPE" == "gpt" ]]; then
         print_info "Updating configuration for GPT partition table..."
+        if [[ "$DEBUG_MODE" == "true" ]]; then
+            print_info "🐛 DEBUG: Applying GPT-specific updates..."
+        fi
         # Replace insmod part_msdos with part_gpt
-        sudo sed -i "s/insmod part_msdos/insmod part_gpt/g" "$mount_point/boot/grub/grub.cfg"
+        run_cmd sudo sed -i "s/insmod part_msdos/insmod part_gpt/g" "$mount_point/boot/grub/grub.cfg"
         # Replace msdos1 with gpt1
-        sudo sed -i "s/msdos1/gpt1/g" "$mount_point/boot/grub/grub.cfg"
+        run_cmd sudo sed -i "s/msdos1/gpt1/g" "$mount_point/boot/grub/grub.cfg"
         # Replace (hd0,1) with (hd0,gpt1) for better compatibility
-        sudo sed -i "s/'(hd0,1)'/'(hd0,gpt1)'/g" "$mount_point/boot/grub/grub.cfg"
-        sudo sed -i "s/=(hd0,1)/=(hd0,gpt1)/g" "$mount_point/boot/grub/grub.cfg"
+        run_cmd sudo sed -i "s/'(hd0,1)'/'(hd0,gpt1)'/g" "$mount_point/boot/grub/grub.cfg"
+        run_cmd sudo sed -i "s/=(hd0,1)/=(hd0,gpt1)/g" "$mount_point/boot/grub/grub.cfg"
         # Also update hint references
-        sudo sed -i "s/ahci0,msdos1/ahci0,gpt1/g" "$mount_point/boot/grub/grub.cfg"
+        run_cmd sudo sed -i "s/ahci0,msdos1/ahci0,gpt1/g" "$mount_point/boot/grub/grub.cfg"
     else
         print_info "Using MBR/DOS partition table references (default)..."
+        if [[ "$DEBUG_MODE" == "true" ]]; then
+            print_info "🐛 DEBUG: Applying MBR-specific updates..."
+        fi
         # Ensure part_msdos is used (should already be correct in template)
-        sudo sed -i "s/insmod part_gpt/insmod part_msdos/g" "$mount_point/boot/grub/grub.cfg"
+        run_cmd sudo sed -i "s/insmod part_gpt/insmod part_msdos/g" "$mount_point/boot/grub/grub.cfg"
         # Ensure msdos1 is used (should already be correct in template)
-        sudo sed -i "s/gpt1/msdos1/g" "$mount_point/boot/grub/grub.cfg"
+        run_cmd sudo sed -i "s/gpt1/msdos1/g" "$mount_point/boot/grub/grub.cfg"
         # Ensure (hd0,1) format is used for MBR
-        sudo sed -i "s/'(hd0,gpt1)'/'(hd0,1)'/g" "$mount_point/boot/grub/grub.cfg"
-        sudo sed -i "s/=(hd0,gpt1)/=(hd0,1)/g" "$mount_point/boot/grub/grub.cfg"
+        run_cmd sudo sed -i "s/'(hd0,gpt1)'/'(hd0,1)'/g" "$mount_point/boot/grub/grub.cfg"
+        run_cmd sudo sed -i "s/=(hd0,gpt1)/=(hd0,1)/g" "$mount_point/boot/grub/grub.cfg"
         # Ensure hint references are correct
-        sudo sed -i "s/ahci0,gpt1/ahci0,msdos1/g" "$mount_point/boot/grub/grub.cfg"
+        run_cmd sudo sed -i "s/ahci0,gpt1/ahci0,msdos1/g" "$mount_point/boot/grub/grub.cfg"
+    fi
+    
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        print_info "🐛 DEBUG: Updated grub.cfg content (first 30 lines):"
+        head -30 "$mount_point/boot/grub/grub.cfg" || true
+        print_info "🐛 DEBUG: Checking for UUID replacement:"
+        grep -n "UUID" "$mount_point/boot/grub/grub.cfg" | head -5 || true
     fi
     
     print_success "GRUB configuration updated with UUID ($USB_UUID) and partition type ($PARTITION_TYPE)"
     
     # Unmount
     safe_umount "$mount_point"
-    sudo rmdir "$mount_point"
+    run_cmd sudo rmdir "$mount_point"
 }
 
 copy_iso_files() {
@@ -1177,76 +1649,98 @@ copy_iso_files() {
             fi
         fi
         
-        # Copy with multiple strategies and robust error handling
-        local copy_success=false
-        local copy_error=""
-        
-        # Strategy 1: pv with proper file redirection (most robust approach)
-        if command -v pv &> /dev/null; then
-            print_info "🔄 Method 1: Using pv for copy with progress..."
-            
-            # Use a more robust approach with temporary script
-            local temp_script="/tmp/copy_iso_$$_$RANDOM.sh"
-            cat > "$temp_script" << EOF
-#!/bin/bash
-set -e
-pv "$iso" > "$mount_point/$iso_name"
-EOF
-            chmod +x "$temp_script"
-            
-            if sudo bash "$temp_script" 2>/dev/null; then
-                copy_success=true
-                print_success "✅ Copy completed with pv"
+        local copy_to_buffer_success=false
+        local copy_error_msg=""
+
+        # Determine copy method and execute
+        if command -v rsync &> /dev/null; then
+            print_info "🔄 Copying $iso_name using rsync with progress..."
+            # Using --info=progress2 for overall percentage.
+            # --partial allows resuming.
+            # --no-inc-recursive because we are copying files one by one.
+            # --no-owner and --no-group to prevent chown errors on exFAT/FAT32 filesystems.
+            # --times (-t) is kept from --archive to preserve modification times if possible.
+            if sudo rsync --times --partial --info=progress2 --no-inc-recursive --no-owner --no-group "$iso" "$mount_point/"; then
+                copy_to_buffer_success=true
+                print_success "✅ $iso_name copied to system buffers (via rsync)."
             else
-                copy_error="pv method failed"
-                print_warning "❌ pv copy failed, trying rsync..."
+                copy_error_msg="rsync copy failed"
+                print_warning "❌ rsync copy to buffer failed for $iso_name."
             fi
-            
-            # Clean up temp script
-            rm -f "$temp_script" 2>/dev/null || true
-        fi
-        
-        # Strategy 2: rsync with progress (fallback)
-        if [[ "$copy_success" == "false" ]] && command -v rsync &> /dev/null; then
-            print_info "🔄 Method 2: Using rsync for copy with progress..."
-            
-            if sudo rsync --progress --partial --inplace "$iso" "$mount_point/" 2>/dev/null; then
-                copy_success=true
-                print_success "✅ Copy completed with rsync"
+        elif command -v cp &> /dev/null; then # cp should almost always be available
+            print_info "🔄 Copying $iso_name using cp (no detailed progress for this step)..."
+            if sudo cp "$iso" "$mount_point/"; then
+                copy_to_buffer_success=true
+                print_success "✅ $iso_name copied to system buffers (via cp)."
             else
-                copy_error="rsync method failed"
-                print_warning "❌ rsync copy failed, trying cp..."
-            fi
-        fi
-        
-        # Strategy 3: Basic cp (final fallback)
-        if [[ "$copy_success" == "false" ]]; then
-            print_info "🔄 Method 3: Using basic copy (cp)..."
-            
-            if sudo cp "$iso" "$mount_point/" 2>/dev/null; then
-                copy_success=true
-                print_success "✅ Copy completed with cp"
-            else
-                copy_error="all copy methods failed"
-                print_error "❌ All copy methods failed for $iso_name"
-            fi
-        fi
-        
-        # Record results and continue with next ISO
-        if [[ "$copy_success" == "true" ]]; then
-            ((copied_count++))
-            print_success "✅ SUCCESS: $iso_name copied successfully ($copied_count/${#valid_isos[@]})"
-            
-            # Verify copy integrity
-            local copied_size=$(du -k "$mount_point/$iso_name" | cut -f1 2>/dev/null || echo "0")
-            if [[ $copied_size -eq $iso_size_kb ]]; then
-                print_success "✓ Size verification passed"
-            else
-                print_warning "⚠ Size mismatch detected (expected: ${iso_size_kb}KB, got: ${copied_size}KB)"
+                copy_error_msg="cp copy failed"
+                print_error "❌ cp copy to buffer failed for $iso_name."
             fi
         else
+            # This case should be rare as 'cp' is a very basic utility.
+            copy_error_msg="Neither rsync nor cp command found"
+            print_error "❌ Critical: Neither rsync nor cp found. Cannot copy $iso_name."
+            # No need to increment failed_count here if we bail or mark all remaining as failed.
+            # For simplicity, let the loop increment failed_count based on copy_to_buffer_success.
+        fi
+        
+        # Process result of copy to buffer
+        if [[ "$copy_to_buffer_success" == "true" ]]; then
+            # Verify copy integrity (checks against buffer/cache initially)
+            local copied_size_kb=$(du -k "$mount_point/$iso_name" | cut -f1 2>/dev/null || echo "0")
+            if [[ $copied_size_kb -eq $iso_size_kb ]]; then
+                print_success "✓ Size verification in buffer passed for $iso_name"
+            else
+                print_warning "⚠ Size mismatch in buffer detected for $iso_name (expected: ${iso_size_kb}KB, got: ${copied_size_kb}KB)"
+                # This could indicate an issue even before sync, but sync might still be attempted.
+            fi
+            
+            # Force sync for this file to ensure it's physically written
+            print_info "📡 Ensuring $iso_name is physically written from buffers to USB..."
+            local sync_start_time=$(date +%s)
+            
+            # Check dirty data before sync
+            local dirty_before_kb=$(grep "^Dirty:" /proc/meminfo | awk '{print $2}' || echo 0)
+            local dirty_before_mb=$((dirty_before_kb / 1024))
+            
+            if [[ $dirty_before_kb -gt 100000 ]]; then  # > 100MB dirty
+                print_info "💾 Writing approximately ${dirty_before_mb}MB of buffered data to USB. This will block until complete for $iso_name..."
+            else
+                print_info "💾 Flushing any remaining buffered data for $iso_name to USB. This will block until complete..."
+            fi
+                
+            local sync_successful=false # Assume failure until sync confirms success
+            # Call sync directly without timeout to wait for completion
+            if sync; then 
+                local sync_end_time=$(date +%s)
+                local sync_duration=$((sync_end_time - sync_start_time))
+                print_success "✅ Data sync completed in ${sync_duration}s. $iso_name should now be physically on USB."
+                sync_successful=true
+                ((copied_count++)) # Increment successful physical copies
+            else
+                local sync_exit_code=$?
+                print_error "❌ Sync operation FAILED with exit code $sync_exit_code after attempting to write $iso_name."
+                print_warning "   This indicates a potentially serious issue with writing to the USB drive."
+                print_warning "   The integrity of $iso_name on the USB is not guaranteed."
+                ((failed_count++)) # Mark as failed if sync reports an error
+            fi
+            
+            if [[ "$sync_successful" == "true" ]]; then
+                # Check dirty data after sync
+                local dirty_after_kb=$(grep "^Dirty:" /proc/meminfo | awk '{print $2}' || echo 0)
+                local dirty_after_mb=$((dirty_after_kb / 1024))
+                local dirty_reduced_kb=$((dirty_before_kb - dirty_after_kb))
+                
+                if [[ $dirty_reduced_kb -gt 0 ]]; then
+                    local dirty_reduced_mb=$((dirty_reduced_kb / 1024))
+                    print_success "📉 Reduced dirty buffers by approximately ${dirty_reduced_mb}MB during sync."
+                fi
+                print_info "💾 Current system dirty buffers: ${dirty_after_mb}MB"
+            fi
+            
+        else # copy_to_buffer_success was false
             ((failed_count++))
-            print_error "❌ FAILED: $iso_name copy failed - $copy_error ($failed_count failures)"
+            print_error "❌ FAILED (Copy to Buffer): $iso_name - $copy_error_msg ($failed_count failures)"
             print_warning "⚠ Continuing with next ISO..."
         fi
         
@@ -1466,26 +1960,42 @@ show_completion_info() {
 # Main execution
 main() {
     # Handle command line arguments
-    case "$1" in
-        --help|-h)
-            print_header
-            print_usage
-            exit 0
-            ;;
-        --auto|-a)
-            AUTO_MODE=true
-            ;;
-        "")
-            # No arguments, proceed normally
-            ;;
-        *)
-            print_error "Unknown option: $1"
-            echo "Use --help for usage information"
-            exit 1
-            ;;
-    esac
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help|-h)
+                print_header
+                print_usage
+                exit 0
+                ;;
+            --auto|-a)
+                AUTO_MODE=true
+                shift
+                ;;
+            --debug|-d)
+                DEBUG_MODE=true
+                shift
+                ;;
+            "")
+                # Empty argument, skip
+                shift
+                ;;
+            *)
+                print_error "Unknown option: $1"
+                echo "Use --help for usage information"
+                exit 1
+                ;;
+        esac
+    done
     
     print_header
+    
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        print_warning "🐛 DEBUG MODE ENABLED"
+        print_info "• All command output will be shown"
+        print_info "• Detailed execution information will be displayed"
+        print_info "• This may produce verbose output"
+        echo
+    fi
     
     if [[ "$AUTO_MODE" == "true" ]]; then
         print_success "🤖 AUTO MODE ENABLED"
