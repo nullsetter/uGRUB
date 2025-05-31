@@ -55,6 +55,51 @@ run_cmd_with_output() {
     fi
 }
 
+# Spinner function for long-running operations
+show_spinner_for_pid() {
+    local pid="$1"
+    local message="$2"
+    local spin='-\|/'
+    local i=0
+    
+    printf "%s " "$message"
+    while kill -0 "$pid" 2>/dev/null; do
+        i=$(( (i+1) %4 ))
+        printf "\r%s [%c]" "$message" "${spin:$i:1}"
+        sleep 0.1
+    done
+    printf "\r%s [✓]%*s\n" "$message" $((50 - ${#message})) ""  # Clear spinner line with spaces
+}
+
+# Enhanced sync function with spinner
+sync_with_spinner() {
+    local message="${1:-💾 Syncing filesystem data...}"
+    local sync_start_time=$(date +%s)
+    local sync_exit_code=0
+    
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        print_info "🐛 DEBUG: Starting sync with spinner (spinner will be shown): $message"
+    fi
+
+    # Always run sync in background and show spinner
+    sync & 
+    local sync_pid=$!
+    show_spinner_for_pid "$sync_pid" "$message"
+    wait "$sync_pid"
+    sync_exit_code=$?
+    
+    local sync_end_time=$(date +%s)
+    local sync_duration=$((sync_end_time - sync_start_time))
+    
+    if [[ $sync_exit_code -eq 0 ]]; then
+        print_success "Sync completed in ${sync_duration}s"
+        return 0
+    else
+        print_error "Sync operation FAILED with exit code $sync_exit_code"
+        return $sync_exit_code
+    fi
+}
+
 # Functions
 print_header() {
     echo -e "${BLUE}============================================${NC}"
@@ -97,6 +142,7 @@ print_usage() {
     echo "  • Enhanced ISO analysis and menu generation"
     echo "  • Multiple themes and customization options"
     echo "  • Comprehensive error handling and diagnostics"
+    echo "  • Visual progress indicators with spinners for long operations"
     echo
     echo "Examples:"
     echo "  $0              # Interactive mode"
@@ -664,16 +710,11 @@ force_cleanup_usb_device() {
     # Change: Make sync blocking here to ensure data is written before unmount attempts.
     local sync_successful=false
 
-    print_info "Attempting robust filesystem sync (will block until complete)..."
-    local sync_start_time=$(date +%s)
-    if sync; then
-        local sync_end_time=$(date +%s)
-        local sync_duration=$((sync_end_time - sync_start_time))
-        print_success "Filesystem sync completed in ${sync_duration}s."
+    # Use the new sync function with spinner
+    if sync_with_spinner "💾 Syncing filesystem data to complete pending writes..."; then
         sync_successful=true
     else
-        local sync_exit_code=$?
-        print_error "Sync operation FAILED with exit code $sync_exit_code."
+        sync_successful=false
         print_warning "This may indicate issues with the storage device or filesystem state."
         # Even if sync fails, we might still be able to proceed, but with caution.
         # The script will attempt to unmount and repartition anyway.
@@ -1697,29 +1738,24 @@ copy_iso_files() {
             
             # Force sync for this file to ensure it's physically written
             print_info "📡 Ensuring $iso_name is physically written from buffers to USB..."
-            local sync_start_time=$(date +%s)
             
             # Check dirty data before sync
             local dirty_before_kb=$(grep "^Dirty:" /proc/meminfo | awk '{print $2}' || echo 0)
             local dirty_before_mb=$((dirty_before_kb / 1024))
             
             if [[ $dirty_before_kb -gt 100000 ]]; then  # > 100MB dirty
-                print_info "💾 Writing approximately ${dirty_before_mb}MB of buffered data to USB. This will block until complete for $iso_name..."
+                local sync_message="💾 Writing ~${dirty_before_mb}MB of buffered data for $iso_name..."
             else
-                print_info "💾 Flushing any remaining buffered data for $iso_name to USB. This will block until complete..."
+                local sync_message="💾 Flushing remaining buffered data for $iso_name..."
             fi
                 
             local sync_successful=false # Assume failure until sync confirms success
-            # Call sync directly without timeout to wait for completion
-            if sync; then 
-                local sync_end_time=$(date +%s)
-                local sync_duration=$((sync_end_time - sync_start_time))
-                print_success "✅ Data sync completed in ${sync_duration}s. $iso_name should now be physically on USB."
+            # Use the new sync function with spinner and custom message
+            if sync_with_spinner "$sync_message"; then 
                 sync_successful=true
                 ((copied_count++)) # Increment successful physical copies
             else
-                local sync_exit_code=$?
-                print_error "❌ Sync operation FAILED with exit code $sync_exit_code after attempting to write $iso_name."
+                print_error "❌ Sync operation FAILED after attempting to write $iso_name."
                 print_warning "   This indicates a potentially serious issue with writing to the USB drive."
                 print_warning "   The integrity of $iso_name on the USB is not guaranteed."
                 ((failed_count++)) # Mark as failed if sync reports an error

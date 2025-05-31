@@ -257,6 +257,97 @@ EOF
     echo "}"
 }
 
+# Generate advanced menu entries for multiple ISOs (used by main script)
+generate_advanced_menu_entries_content() {
+    local mount_point="$1"
+    shift
+    local iso_files=("$@")
+    local entries=""
+    local entries_count=0
+    
+    print_info "🔍 Analyzing ${#iso_files[@]} ISO(s) with advanced detection..."
+    
+    for iso_path in "${iso_files[@]}"; do
+        local iso_name=$(basename "$iso_path")
+        print_info "📝 Analyzing $iso_name with advanced detection..."
+        
+        # Use the detection function to analyze the ISO
+        if detect_iso_boot_files "$iso_path"; then
+            print_success "✓ Detected: $ISO_DISTRO (kernel: $ISO_KERNEL, initrd: $ISO_INITRD)"
+            
+            # Generate entry using detected information
+            local entry_title=""
+            case "$ISO_DISTRO" in
+                ubuntu) entry_title="Ubuntu - $iso_name" ;;
+                kubuntu) entry_title="Kubuntu - $iso_name" ;;
+                xubuntu) entry_title="Xubuntu - $iso_name" ;;
+                lubuntu) entry_title="Lubuntu - $iso_name" ;;
+                mint) entry_title="Linux Mint - $iso_name" ;;
+                elementary) entry_title="elementary OS - $iso_name" ;;
+                debian) entry_title="Debian - $iso_name" ;;
+                debian-live) entry_title="Debian Live - $iso_name" ;;
+                arch) entry_title="Arch Linux - $iso_name" ;;
+                manjaro) entry_title="Manjaro - $iso_name" ;;
+                antergos) entry_title="Antergos - $iso_name" ;;
+                fedora) entry_title="Fedora - $iso_name" ;;
+                centos) entry_title="CentOS - $iso_name" ;;
+                opensuse) entry_title="openSUSE - $iso_name" ;;
+                *) entry_title="Linux ISO - $iso_name" ;;
+            esac
+            
+            local class_name=$(echo "$ISO_DISTRO" | tr '[:upper:]' '[:lower:]' | tr ' -' '__')
+            
+            # Build the menu entry
+            entries+="# $ISO_DISTRO - $iso_name"$'\n'
+            entries+="menuentry \"$entry_title\" --class $class_name --class linux {"$'\n'
+            entries+="    set root='(hd0,$PARTITION_REF)'"$'\n'
+            entries+="    set isofile=\"/$iso_name\""$'\n'
+            entries+="    loopback loop \$isofile"$'\n'
+            
+            if [[ -n "$ISO_KERNEL" ]]; then
+                entries+="    linux (loop)$ISO_KERNEL $ISO_BOOT_PARAMS"$'\n'
+            else
+                entries+="    # ERROR: No kernel found for $iso_name!"$'\n'
+                print_warning "⚠ No kernel detected for $iso_name"
+            fi
+            
+            if [[ -n "$ISO_INITRD" ]]; then
+                entries+="    initrd (loop)$ISO_INITRD"$'\n'
+            else
+                entries+="    # WARNING: No initrd found for $iso_name"$'\n'
+                print_warning "⚠ No initrd detected for $iso_name"
+            fi
+            
+            entries+="}"$'\n'
+            entries+=""$'\n'
+            ((entries_count++))
+            
+        else
+            print_warning "⚠ Could not detect boot files for $iso_name, creating generic entry..."
+            
+            # Fallback to generic entry
+            entries+="# Generic entry for $iso_name (auto-detection failed)"$'\n'
+            entries+="menuentry \"Linux ISO - $iso_name\" --class linux {"$'\n'
+            entries+="    set root='(hd0,$PARTITION_REF)'"$'\n'
+            entries+="    set isofile=\"/$iso_name\""$'\n'
+            entries+="    loopback loop \$isofile"$'\n'
+            entries+="    linux (loop)/casper/vmlinuz boot=casper iso-scan/filename=\${isofile} quiet splash"$'\n'
+            entries+="    initrd (loop)/casper/initrd"$'\n'
+            entries+="}"$'\n'
+            entries+=""$'\n'
+            ((entries_count++))
+        fi
+    done
+    
+    if [[ $entries_count -gt 0 ]]; then
+        print_success "📝 Generated $entries_count advanced menu entries"
+    else
+        print_warning "⚠ No menu entries were created"
+    fi
+    
+    echo "$entries"
+}
+
 # Batch analyze all ISOs in a directory
 analyze_iso_directory() {
     local iso_dir="$1"
