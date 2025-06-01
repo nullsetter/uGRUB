@@ -2057,14 +2057,14 @@ generate_advanced_menu_entries_content_two_partition() {
             local enhanced_boot_params=""
             case "$ISO_DISTRO" in
                 mint)
-                    # Linux Mint requires special handling for two-partition layout
-                    enhanced_boot_params="boot=casper findiso=\${isofile} toram quiet splash"
+                    # Linux Mint requires special handling for two-partition layout with USB stability
+                    enhanced_boot_params="boot=casper findiso=\${isofile} toram=filesystem.squashfs noeject cdrom-detect/try-usb=true quiet splash plymouth.ignore-serial-consoles"
                     ;;
                 ubuntu|kubuntu|xubuntu|lubuntu|elementary|debian)
-                    enhanced_boot_params="boot=casper iso-scan/filename=\${isofile} quiet splash"
+                    enhanced_boot_params="boot=casper iso-scan/filename=\${isofile} noeject cdrom-detect/try-usb=true quiet splash"
                     ;;
                 *)
-                    enhanced_boot_params="$ISO_BOOT_PARAMS"
+                    enhanced_boot_params="$ISO_BOOT_PARAMS noeject cdrom-detect/try-usb=true"
                     ;;
             esac
             
@@ -2090,69 +2090,138 @@ generate_advanced_menu_entries_content_two_partition() {
             
             local class_name=$(echo "$ISO_DISTRO" | tr '[:upper:]' '[:lower:]' | tr ' -' '__')
             
-            # Build the menu entry for two-partition layout
-            entries+="# $ISO_DISTRO - $iso_name (Data Partition, Auto-detected)"$'\n'
+            # Build the menu entry for two-partition layout with enhanced USB stability
+            entries+="# $ISO_DISTRO - $iso_name (Data Partition, Auto-detected with USB stability)"$'\n'
             entries+="menuentry \"$entry_title\" --class $class_name --class linux {"$'\n'
             
-            # Add required modules for two-partition layout
-            entries+="    # Load required modules for two-partition layout"$'\n'
+            # Add required modules for two-partition layout with enhanced order
+            entries+="    # Load required modules for two-partition layout (enhanced order)"$'\n'
+            entries+="    insmod part_gpt"$'\n'
+            entries+="    insmod part_msdos"$'\n'
             entries+="    insmod exfat"$'\n'
             entries+="    insmod fat"$'\n'
+            entries+="    insmod ext2"$'\n'
             entries+="    insmod iso9660"$'\n'
             entries+="    insmod loopback"$'\n'
+            entries+="    insmod search"$'\n'
+            entries+="    insmod search_fs_uuid"$'\n'
+            entries+="    insmod search_fs_file"$'\n'
             entries+="    "$'\n'
             
-            entries+="    # Set root to data partition where ISOs are stored"$'\n'
-            entries+="    set root=\$data_root"$'\n'
+            # Enhanced root detection with multiple fallbacks
+            entries+="    # Enhanced root detection with multiple fallbacks for USB stability"$'\n'
+            entries+="    if [ x\$feature_platform_search_hint = xy ]; then"$'\n'
+            entries+="        search --no-floppy --fs-uuid --set=root --hint-bios=hd0,gpt2 --hint-efi=hd0,gpt2 --hint-baremetal=ahci0,gpt2 \$data_root"$'\n'
+            entries+="    else"$'\n'
+            entries+="        search --no-floppy --fs-uuid --set=root \$data_root"$'\n'
+            entries+="    fi"$'\n'
+            entries+="    "$'\n'
+            entries+="    # Fallback root detection methods"$'\n'
+            entries+="    if [ -z \"\$root\" ]; then"$'\n'
+            entries+="        search --no-floppy --set=root --label \"Multiboot\""$'\n'
+            entries+="    fi"$'\n'
+            entries+="    if [ -z \"\$root\" ]; then"$'\n'
+            entries+="        set root=\$data_root"$'\n'
+            entries+="    fi"$'\n'
+            entries+="    "$'\n'
+            
+            # Enhanced loopback with error handling  
             entries+="    set isofile=\"/$iso_name\""$'\n'
-            entries+="    loopback loop \$isofile"$'\n'
+            entries+="    "$'\n'
+            entries+="    # Enhanced loopback with error handling"$'\n'
+            entries+="    if loopback loop \$isofile; then"$'\n'
             
             if [[ -n "$ISO_KERNEL" ]]; then
-                entries+="    linux (loop)$ISO_KERNEL $enhanced_boot_params"$'\n'
+                entries+="        # Verify loop device and boot with enhanced parameters"$'\n'
+                entries+="        if [ -f (loop)$ISO_KERNEL ]; then"$'\n'
+                entries+="            linux (loop)$ISO_KERNEL $enhanced_boot_params"$'\n'
+                if [[ -n "$ISO_INITRD" ]]; then
+                    entries+="            initrd (loop)$ISO_INITRD"$'\n'
+                fi
+                entries+="        else"$'\n'
+                entries+="            echo \"Error: Kernel file not found in loop device\""$'\n'
+                entries+="            echo \"Press any key to return to menu...\""$'\n'
+                entries+="            read"$'\n'
+                entries+="        fi"$'\n'
             else
-                entries+="    # ERROR: No kernel found for $iso_name!"$'\n'
+                entries+="        # ERROR: No kernel found for $iso_name!"$'\n'
+                entries+="        echo \"Error: No kernel detected for $iso_name\""$'\n'
+                entries+="        echo \"Press any key to return to menu...\""$'\n'
+                entries+="        read"$'\n'
                 >&2 print_warning "⚠ No kernel detected for $iso_name"
             fi
             
-            if [[ -n "$ISO_INITRD" ]]; then
-                entries+="    initrd (loop)$ISO_INITRD"$'\n'
-            else
-                entries+="    # WARNING: No initrd found for $iso_name"$'\n'
-                >&2 print_warning "⚠ No initrd detected for $iso_name"
-            fi
-            
+            entries+="    else"$'\n'
+            entries+="        echo \"Error: Cannot create loopback device for ISO\""$'\n'
+            entries+="        echo \"This may indicate USB or filesystem issues\""$'\n'
+            entries+="        echo \"Press any key to return to menu...\""$'\n'
+            entries+="        read"$'\n'
+            entries+="    fi"$'\n'
             entries+="}"$'\n'
             entries+=""$'\n'
+            
+            # Add special TORAM variant for Linux Mint
+            if [[ "$ISO_DISTRO" == "mint" ]]; then
+                entries+="# $ISO_DISTRO - $iso_name (TORAM - For USB Issues)"$'\n'
+                entries+="menuentry \"$entry_title - TORAM Boot\" --class $class_name --class linux {"$'\n'
+                entries+="    insmod part_gpt"$'\n'
+                entries+="    insmod exfat"$'\n'
+                entries+="    insmod iso9660"$'\n'
+                entries+="    insmod loopback"$'\n'
+                entries+="    "$'\n'
+                entries+="    search --no-floppy --fs-uuid --set=root \$data_root"$'\n'
+                entries+="    set isofile=\"/$iso_name\""$'\n'
+                entries+="    loopback loop \$isofile"$'\n'
+                entries+="    "$'\n'
+                entries+="    # TORAM loads everything to RAM, bypassing USB issues"$'\n'
+                if [[ -n "$ISO_KERNEL" ]]; then
+                    entries+="    linux (loop)$ISO_KERNEL boot=casper findiso=\${isofile} toram noeject"$'\n'
+                fi
+                if [[ -n "$ISO_INITRD" ]]; then
+                    entries+="    initrd (loop)$ISO_INITRD"$'\n'
+                fi
+                entries+="}"$'\n'
+                entries+=""$'\n'
+            fi
+            
             ((entries_count++))
-            >&2 print_success "✓ Added advanced entry for $ISO_DISTRO (two-partition)"
+            >&2 print_success "✓ Added advanced entry for $ISO_DISTRO (two-partition with USB stability)"
             
         else
             >&2 print_warning "⚠ Could not detect boot files for $iso_name, creating generic entry..."
             
-            # Fallback to generic entry for two-partition layout
-            entries+="# Generic entry for $iso_name (auto-detection failed, two-partition)"$'\n'
+            # Fallback to generic entry for two-partition layout with USB stability
+            entries+="# Generic entry for $iso_name (auto-detection failed, two-partition with USB stability)"$'\n'
             entries+="menuentry \"Linux ISO - $iso_name\" --class linux {"$'\n'
             entries+="    # Load required modules"$'\n'
+            entries+="    insmod part_gpt"$'\n'
             entries+="    insmod exfat"$'\n'
             entries+="    insmod fat"$'\n'
             entries+="    insmod iso9660"$'\n'
             entries+="    insmod loopback"$'\n'
             entries+="    "$'\n'
-            entries+="    # Set root to data partition where ISOs are stored"$'\n'
-            entries+="    set root=\$data_root"$'\n'
+            entries+="    # Enhanced root detection for USB stability"$'\n'
+            entries+="    search --no-floppy --fs-uuid --set=root \$data_root"$'\n'
             entries+="    set isofile=\"/$iso_name\""$'\n'
-            entries+="    loopback loop \$isofile"$'\n'
-            entries+="    linux (loop)/casper/vmlinuz boot=casper findiso=\${isofile} quiet splash"$'\n'
-            entries+="    initrd (loop)/casper/initrd"$'\n'
+            entries+="    "$'\n'
+            entries+="    # Enhanced loopback with error handling"$'\n'
+            entries+="    if loopback loop \$isofile; then"$'\n'
+            entries+="        linux (loop)/casper/vmlinuz boot=casper findiso=\${isofile} noeject cdrom-detect/try-usb=true quiet splash"$'\n'
+            entries+="        initrd (loop)/casper/initrd"$'\n'
+            entries+="    else"$'\n'
+            entries+="        echo \"Error: Cannot create loopback device\""$'\n'
+            entries+="        echo \"Press any key to return to menu...\""$'\n'
+            entries+="        read"$'\n'
+            entries+="    fi"$'\n'
             entries+="}"$'\n'
             entries+=""$'\n'
             ((entries_count++))
-            >&2 print_success "✓ Added generic entry (two-partition)"
+            >&2 print_success "✓ Added generic entry (two-partition with USB stability)"
         fi
     done
     
     if [[ $entries_count -gt 0 ]]; then
-        >&2 print_success "📝 Generated $entries_count advanced menu entries for two-partition layout"
+        >&2 print_success "📝 Generated $entries_count advanced menu entries for two-partition layout with USB stability"
     else
         >&2 print_warning "⚠ No advanced menu entries were created"
     fi
