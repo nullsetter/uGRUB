@@ -196,18 +196,18 @@ find_iso_initrds() {
     printf '%s\n' "${initrds[@]}" | sort -u
 }
 
-# Set appropriate boot parameters based on distribution
+# Set appropriate boot parameters based on distribution for two-partition layout
 set_iso_boot_params() {
     local distro="$1"
     local mount_point="$2"
     
     case "$distro" in
         ubuntu|kubuntu|xubuntu|lubuntu|elementary|debian)
-            ISO_BOOT_PARAMS="boot=casper iso-scan/filename=\${isofile} quiet splash"
+            # Modern Ubuntu/Debian: use findiso for exFAT compatibility
+            ISO_BOOT_PARAMS="boot=casper findiso=\${isofile} quiet splash"
             ;;
         mint)
-            # Linux Mint requires special handling for two-partition layout
-            # Use findiso parameter which works better than iso-scan for exFAT partition
+            # Linux Mint: findiso works better with exFAT than iso-scan
             ISO_BOOT_PARAMS="boot=casper findiso=\${isofile} quiet splash"
             ;;
         arch|manjaro|antergos)
@@ -223,7 +223,7 @@ set_iso_boot_params() {
             ISO_BOOT_PARAMS="boot=live components quiet splash findiso=\${isofile}"
             ;;
         *)
-            # Default fallback - try findiso first, then iso-scan
+            # Default fallback - use findiso for better exFAT compatibility
             ISO_BOOT_PARAMS="boot=casper findiso=\${isofile} quiet splash"
             ;;
     esac

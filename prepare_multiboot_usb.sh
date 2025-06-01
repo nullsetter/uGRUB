@@ -1166,8 +1166,8 @@ partition_usb() {
         exit 1
     fi
     
-    # Calculate partition sizes (ESP: 1GB, Data: remaining)
-    local esp_size_mb=1024
+    # Calculate partition sizes (ESP: 256MB, Data: remaining)
+    local esp_size_mb=256
     local esp_size_sectors=$((esp_size_mb * 2048))  # 1MB = 2048 sectors
     local data_start_sector=$((2048 + esp_size_sectors))
     
@@ -2043,28 +2043,25 @@ generate_advanced_menu_entries_content_two_partition() {
     local entries_count=0
     
     # Analyze ISOs quietly - all print statements go to stderr, not stdout
-    >&2 print_info "🔍 Analyzing ${#iso_files[@]} ISO(s) with advanced detection (two-partition layout)..."
+    >&2 print_info "🔍 Analyzing ${#iso_files[@]} ISO(s) with modern exFAT-optimized detection..."
     
     for iso_path in "${iso_files[@]}"; do
         local iso_name=$(basename "$iso_path")
-        >&2 print_info "📝 Analyzing $iso_name with advanced detection..."
+        >&2 print_info "📝 Analyzing $iso_name with modern detection..."
         
         # Use the detection function to analyze the ISO
         if detect_iso_boot_files "$iso_path"; then
             >&2 print_success "✓ Detected: $ISO_DISTRO (kernel: $ISO_KERNEL, initrd: $ISO_INITRD)"
             
-            # Set appropriate boot parameters based on distribution for two-partition layout
-            local enhanced_boot_params=""
+            # Set modern boot parameters for exFAT compatibility
+            local modern_boot_params=""
             case "$ISO_DISTRO" in
-                mint)
-                    # Linux Mint requires special handling for two-partition layout with USB stability
-                    enhanced_boot_params="boot=casper findiso=\${isofile} toram=filesystem.squashfs noeject cdrom-detect/try-usb=true quiet splash plymouth.ignore-serial-consoles"
-                    ;;
-                ubuntu|kubuntu|xubuntu|lubuntu|elementary|debian)
-                    enhanced_boot_params="boot=casper iso-scan/filename=\${isofile} noeject cdrom-detect/try-usb=true quiet splash"
+                mint|ubuntu|kubuntu|xubuntu|lubuntu|elementary|debian)
+                    # Modern approach: use findiso for exFAT compatibility
+                    modern_boot_params="boot=casper findiso=\${isofile} quiet splash"
                     ;;
                 *)
-                    enhanced_boot_params="$ISO_BOOT_PARAMS noeject cdrom-detect/try-usb=true"
+                    modern_boot_params="$ISO_BOOT_PARAMS"
                     ;;
             esac
             
@@ -2090,123 +2087,75 @@ generate_advanced_menu_entries_content_two_partition() {
             
             local class_name=$(echo "$ISO_DISTRO" | tr '[:upper:]' '[:lower:]' | tr ' -' '__')
             
-            # Build the menu entry for two-partition layout with enhanced USB stability
-            entries+="# $ISO_DISTRO - $iso_name (Data Partition, Auto-detected with USB stability)"$'\n'
+            # Build the modern menu entry with exFAT optimization
+            entries+="# $ISO_DISTRO - $iso_name (Modern exFAT-optimized entry)"$'\n'
             entries+="menuentry \"$entry_title\" --class $class_name --class linux {"$'\n'
-            
-            # Add required modules for two-partition layout with enhanced order
-            entries+="    # Load required modules for two-partition layout (enhanced order)"$'\n'
-            entries+="    insmod part_gpt"$'\n'
-            entries+="    insmod part_msdos"$'\n'
-            entries+="    insmod exfat"$'\n'
-            entries+="    insmod fat"$'\n'
-            entries+="    insmod ext2"$'\n'
-            entries+="    insmod iso9660"$'\n'
-            entries+="    insmod loopback"$'\n'
-            entries+="    insmod search"$'\n'
-            entries+="    insmod search_fs_uuid"$'\n'
-            entries+="    insmod search_fs_file"$'\n'
-            entries+="    "$'\n'
-            
-            # Enhanced root detection with multiple fallbacks
-            entries+="    # Enhanced root detection with multiple fallbacks for USB stability"$'\n'
-            entries+="    if [ x\$feature_platform_search_hint = xy ]; then"$'\n'
-            entries+="        search --no-floppy --fs-uuid --set=root --hint-bios=hd0,gpt2 --hint-efi=hd0,gpt2 --hint-baremetal=ahci0,gpt2 \$data_root"$'\n'
-            entries+="    else"$'\n'
-            entries+="        search --no-floppy --fs-uuid --set=root \$data_root"$'\n'
-            entries+="    fi"$'\n'
-            entries+="    "$'\n'
-            entries+="    # Fallback root detection methods"$'\n'
-            entries+="    if [ -z \"\$root\" ]; then"$'\n'
-            entries+="        search --no-floppy --set=root --label \"Multiboot\""$'\n'
-            entries+="    fi"$'\n'
-            entries+="    if [ -z \"\$root\" ]; then"$'\n'
-            entries+="        set root=\$data_root"$'\n'
-            entries+="    fi"$'\n'
-            entries+="    "$'\n'
-            
-            # Enhanced loopback with error handling  
-            entries+="    set isofile=\"/$iso_name\""$'\n'
+            entries+="    # Use modern helper function with enhanced fallback"$'\n'
+            entries+="    set_iso_path_with_fallback \"/$iso_name\""$'\n'
             entries+="    "$'\n'
             entries+="    # Enhanced loopback with error handling"$'\n'
             entries+="    if loopback loop \$isofile; then"$'\n'
             
             if [[ -n "$ISO_KERNEL" ]]; then
-                entries+="        # Verify loop device and boot with enhanced parameters"$'\n'
-                entries+="        if [ -f (loop)$ISO_KERNEL ]; then"$'\n'
-                entries+="            linux (loop)$ISO_KERNEL $enhanced_boot_params"$'\n'
+                entries+="        # Boot with modern exFAT-compatible parameters"$'\n'
+                entries+="        linux (loop)$ISO_KERNEL $modern_boot_params"$'\n'
                 if [[ -n "$ISO_INITRD" ]]; then
-                    entries+="            initrd (loop)$ISO_INITRD"$'\n'
+                    entries+="        initrd (loop)$ISO_INITRD"$'\n'
                 fi
-                entries+="        else"$'\n'
-                entries+="            echo \"Error: Kernel file not found in loop device\""$'\n'
-                entries+="            echo \"Press any key to return to menu...\""$'\n'
-                entries+="            read"$'\n'
-                entries+="        fi"$'\n'
             else
-                entries+="        # ERROR: No kernel found for $iso_name!"$'\n'
-                entries+="        echo \"Error: No kernel detected for $iso_name\""$'\n'
+                entries+="        echo \"Error: No kernel found for $iso_name\""$'\n'
                 entries+="        echo \"Press any key to return to menu...\""$'\n'
                 entries+="        read"$'\n'
                 >&2 print_warning "⚠ No kernel detected for $iso_name"
             fi
             
             entries+="    else"$'\n'
-            entries+="        echo \"Error: Cannot create loopback device for ISO\""$'\n'
-            entries+="        echo \"This may indicate USB or filesystem issues\""$'\n'
+            entries+="        echo \"Error: Cannot create loopback device for $iso_name\""$'\n'
+            entries+="        echo \"Check if ISO exists on data partition\""$'\n'
             entries+="        echo \"Press any key to return to menu...\""$'\n'
             entries+="        read"$'\n'
             entries+="    fi"$'\n'
             entries+="}"$'\n'
             entries+=""$'\n'
             
-            # Add special TORAM variant for Linux Mint
-            if [[ "$ISO_DISTRO" == "mint" ]]; then
-                entries+="# $ISO_DISTRO - $iso_name (TORAM - For USB Issues)"$'\n'
+            # Add TORAM variant for Ubuntu-based systems (exFAT compatibility)
+            if [[ "$ISO_DISTRO" =~ ^(mint|ubuntu|kubuntu|xubuntu|lubuntu|elementary|debian)$ ]]; then
+                entries+="# $ISO_DISTRO - $iso_name (TORAM - Best for exFAT)"$'\n'
                 entries+="menuentry \"$entry_title - TORAM Boot\" --class $class_name --class linux {"$'\n'
-                entries+="    insmod part_gpt"$'\n'
-                entries+="    insmod exfat"$'\n'
-                entries+="    insmod iso9660"$'\n'
-                entries+="    insmod loopback"$'\n'
+                entries+="    # TORAM loads everything to RAM, bypassing filesystem issues"$'\n'
+                entries+="    set_iso_path_with_fallback \"/$iso_name\""$'\n'
                 entries+="    "$'\n'
-                entries+="    search --no-floppy --fs-uuid --set=root \$data_root"$'\n'
-                entries+="    set isofile=\"/$iso_name\""$'\n'
-                entries+="    loopback loop \$isofile"$'\n'
-                entries+="    "$'\n'
-                entries+="    # TORAM loads everything to RAM, bypassing USB issues"$'\n'
+                entries+="    if loopback loop \$isofile; then"$'\n'
                 if [[ -n "$ISO_KERNEL" ]]; then
-                    entries+="    linux (loop)$ISO_KERNEL boot=casper findiso=\${isofile} toram noeject"$'\n'
+                    entries+="        # TORAM boot with simplified parameters"$'\n'
+                    entries+="        linux (loop)$ISO_KERNEL boot=casper findiso=\${isofile} toram quiet splash"$'\n'
                 fi
                 if [[ -n "$ISO_INITRD" ]]; then
-                    entries+="    initrd (loop)$ISO_INITRD"$'\n'
+                    entries+="        initrd (loop)$ISO_INITRD"$'\n'
                 fi
+                entries+="    else"$'\n'
+                entries+="        echo \"Error: Cannot load ISO for TORAM boot\""$'\n'
+                entries+="        read"$'\n'
+                entries+="    fi"$'\n'
                 entries+="}"$'\n'
                 entries+=""$'\n'
             fi
             
             ((entries_count++))
-            >&2 print_success "✓ Added advanced entry for $ISO_DISTRO (two-partition with USB stability)"
+            >&2 print_success "✓ Added modern exFAT-optimized entry for $ISO_DISTRO"
             
         else
-            >&2 print_warning "⚠ Could not detect boot files for $iso_name, creating generic entry..."
+            >&2 print_warning "⚠ Could not detect boot files for $iso_name, creating modern generic entry..."
             
-            # Fallback to generic entry for two-partition layout with USB stability
-            entries+="# Generic entry for $iso_name (auto-detection failed, two-partition with USB stability)"$'\n'
+            # Fallback to modern generic entry with exFAT optimization
+            entries+="# Generic entry for $iso_name (modern exFAT-optimized)"$'\n'
             entries+="menuentry \"Linux ISO - $iso_name\" --class linux {"$'\n'
-            entries+="    # Load required modules"$'\n'
-            entries+="    insmod part_gpt"$'\n'
-            entries+="    insmod exfat"$'\n'
-            entries+="    insmod fat"$'\n'
-            entries+="    insmod iso9660"$'\n'
-            entries+="    insmod loopback"$'\n'
+            entries+="    # Modern generic entry with enhanced fallback"$'\n'
+            entries+="    set_iso_path_with_fallback \"/$iso_name\""$'\n'
             entries+="    "$'\n'
-            entries+="    # Enhanced root detection for USB stability"$'\n'
-            entries+="    search --no-floppy --fs-uuid --set=root \$data_root"$'\n'
-            entries+="    set isofile=\"/$iso_name\""$'\n'
-            entries+="    "$'\n'
-            entries+="    # Enhanced loopback with error handling"$'\n'
             entries+="    if loopback loop \$isofile; then"$'\n'
-            entries+="        linux (loop)/casper/vmlinuz boot=casper findiso=\${isofile} noeject cdrom-detect/try-usb=true quiet splash"$'\n'
+            entries+="        # Try modern findiso approach first"$'\n'
+            entries+="        linux (loop)/casper/vmlinuz boot=casper findiso=\${isofile} quiet splash"$'\n'
             entries+="        initrd (loop)/casper/initrd"$'\n'
             entries+="    else"$'\n'
             entries+="        echo \"Error: Cannot create loopback device\""$'\n'
@@ -2216,14 +2165,14 @@ generate_advanced_menu_entries_content_two_partition() {
             entries+="}"$'\n'
             entries+=""$'\n'
             ((entries_count++))
-            >&2 print_success "✓ Added generic entry (two-partition with USB stability)"
+            >&2 print_success "✓ Added modern generic entry with exFAT optimization"
         fi
     done
     
     if [[ $entries_count -gt 0 ]]; then
-        >&2 print_success "📝 Generated $entries_count advanced menu entries for two-partition layout with USB stability"
+        >&2 print_success "📝 Generated $entries_count modern exFAT-optimized menu entries"
     else
-        >&2 print_warning "⚠ No advanced menu entries were created"
+        >&2 print_warning "⚠ No modern menu entries were created"
     fi
     
     echo "$entries"
