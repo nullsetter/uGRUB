@@ -62,13 +62,28 @@ show_spinner_for_pid() {
     local spin='-\|/'
     local i=0
     
-    printf "%s " "$message"
+    # Get terminal width, default to 80 if not available
+    local term_width=$(tput cols 2>/dev/null || echo "80")
+    local max_msg_length=$((term_width - 10))  # Leave space for spinner and brackets
+    
+    # Truncate message if it's too long to prevent line wrapping
+    local display_message="$message"
+    if [[ ${#message} -gt $max_msg_length ]]; then
+        display_message="${message:0:$max_msg_length}..."
+    fi
+    
+    # Print initial message
+    printf "%s " "$display_message"
+    
     while kill -0 "$pid" 2>/dev/null; do
         i=$(( (i+1) %4 ))
-        printf "\r%s [%c]" "$message" "${spin:$i:1}"
+        # Use \r to return to start of line, then clear the line and reprint
+        printf "\r\033[K%s [%c]" "$display_message" "${spin:$i:1}"
         sleep 0.1
     done
-    printf "\r%s [✓]%*s\n" "$message" $((50 - ${#message})) ""  # Clear spinner line with spaces
+    
+    # Final success message - clear line and print completion
+    printf "\r\033[K%s [✓]\n" "$display_message"
 }
 
 # Enhanced sync function with spinner
@@ -1610,12 +1625,29 @@ get_usb_uuid() {
 detect_partition_table_type() {
     print_info "Detecting partition table type..."
     
-    local partition_table_type=$(run_cmd sudo fdisk -l "$USB_DEVICE" | grep "Disklabel type:" | awk '{print $3}' || true)
+    # Use direct command execution to ensure we get the output
+    local partition_table_type=$(sudo fdisk -l "$USB_DEVICE" 2>/dev/null | grep "Disklabel type:" | awk '{print $3}' || true)
     
     if [[ "$DEBUG_MODE" == "true" ]]; then
         print_info "🐛 DEBUG: Full fdisk output for partition table detection:"
         run_cmd_with_output sudo fdisk -l "$USB_DEVICE"
         print_info "🐛 DEBUG: Detected partition table type: '$partition_table_type'"
+    fi
+    
+    # Additional fallback detection method if fdisk doesn't show Disklabel type
+    if [[ -z "$partition_table_type" ]]; then
+        print_info "Primary detection failed, using fallback method..."
+        # Check for GPT using blkid
+        local gpt_check=$(sudo blkid -p -s PTTYPE "$USB_DEVICE" 2>/dev/null | grep -o "gpt" || true)
+        if [[ "$gpt_check" == "gpt" ]]; then
+            partition_table_type="gpt"
+        else
+            partition_table_type="dos"
+        fi
+        
+        if [[ "$DEBUG_MODE" == "true" ]]; then
+            print_info "🐛 DEBUG: Fallback detection result: '$partition_table_type'"
+        fi
     fi
     
     if [[ "$partition_table_type" == "gpt" ]]; then
@@ -1653,57 +1685,42 @@ update_grub_config() {
         head -20 "$esp_mount_point/boot/grub/grub.cfg" || true
     fi
     
-    # Update grub.cfg with the data partition UUID for ISO access
+    # Verify we have both UUIDs
+    if [[ -z "$ESP_UUID" ]]; then
+        print_error "Cannot update grub.cfg: ESP_UUID is empty!"
+        print_warning "GRUB configuration will NOT be updated with ESP UUID. This will cause font loading issues."
+        ESP_UUID="ESP-UUID-MISSING"
+    fi
+    
     if [[ -z "$DATA_UUID" ]]; then
         print_error "Cannot update grub.cfg: DATA_UUID is empty!"
-        print_warning "GRUB configuration will NOT be updated with Data UUID. This will likely cause boot issues."
-    else
-        if [[ "$DEBUG_MODE" == "true" ]]; then
-            print_info "🐛 DEBUG: Updating YOUR_UUID placeholders with Data UUID '$DATA_UUID' using '#' delimiter in sed..."
-        fi
-        # Use # as delimiter for sed to avoid issues if UUID could contain /
-        # This updates references to the data partition where ISOs are stored
-        run_cmd sudo sed -i "s#YOUR_UUID#${DATA_UUID}#g" "$esp_mount_point/boot/grub/grub.cfg"
+        print_warning "GRUB configuration will NOT be updated with Data UUID. This will cause ISO boot issues."
+        DATA_UUID="DATA-UUID-MISSING"
     fi
     
-    # Add specific configuration for two-partition layout
-    print_info "Configuring GRUB for two-partition layout..."
+    # Determine correct partition references based on detected type
+    local esp_partition_ref="msdos1"
+    local data_partition_ref="msdos2" 
+    local esp_hints="--hint-bios=hd0,msdos1 --hint-efi=hd0,msdos1 --hint-baremetal=ahci0,msdos1"
+    local data_hints="--hint-bios=hd0,msdos2 --hint-efi=hd0,msdos2 --hint-baremetal=ahci0,msdos2"
     
-    # Create a helper configuration snippet for the data partition
-    local data_config_snippet="
-# Two-partition multiboot configuration
-# ESP (current): UUID=${ESP_UUID:-unknown}
-# Data partition: UUID=${DATA_UUID:-unknown}
-
-# Set default search path for ISOs to data partition
-set iso_root='hd0,${PARTITION_REF/1/2}'
-if [ -n \"${DATA_UUID}\" ]; then
-    search --no-floppy --fs-uuid --set=iso_root ${DATA_UUID}
-fi
-
-# Helper function to set ISO path
-function set_iso_path {
-    set isofile=\"\$1\"
-    # ISOs are stored on the data partition
-    set root=\$iso_root
-}
-"
+    if [[ "$PARTITION_TYPE" == "gpt" ]]; then
+        esp_partition_ref="gpt1"
+        data_partition_ref="gpt2"
+        esp_hints="--hint-bios=hd0,gpt1 --hint-efi=hd0,gpt1 --hint-baremetal=ahci0,gpt1"
+        data_hints="--hint-bios=hd0,gpt2 --hint-efi=hd0,gpt2 --hint-baremetal=ahci0,gpt2"
+    fi
     
-    # Insert the configuration snippet at the beginning of the main config
     if [[ "$DEBUG_MODE" == "true" ]]; then
-        print_info "🐛 DEBUG: Adding two-partition configuration snippet..."
+        print_info "🐛 DEBUG: Using partition references - ESP: $esp_partition_ref, Data: $data_partition_ref"
+        print_info "🐛 DEBUG: ESP UUID: '$ESP_UUID', Data UUID: '$DATA_UUID'"
+        print_info "🐛 DEBUG: Partition type: $PARTITION_TYPE"
     fi
     
-    # Create temporary file with new content
-    local temp_config="/tmp/grub_config_temp"
-    {
-        echo "$data_config_snippet"
-        cat "$esp_mount_point/boot/grub/grub.cfg"
-    } > "$temp_config"
-    
-    # Replace the original config
-    run_cmd sudo cp "$temp_config" "$esp_mount_point/boot/grub/grub.cfg"
-    run_cmd rm -f "$temp_config"
+    # Replace UUID placeholders
+    print_info "Replacing UUID placeholders with actual values..."
+    run_cmd sudo sed -i "s/ESP_UUID_PLACEHOLDER/${ESP_UUID}/g" "$esp_mount_point/boot/grub/grub.cfg"
+    run_cmd sudo sed -i "s/DATA_UUID_PLACEHOLDER/${DATA_UUID}/g" "$esp_mount_point/boot/grub/grub.cfg"
     
     # Update partition table references based on detected type
     if [[ "$PARTITION_TYPE" == "gpt" ]]; then
@@ -1711,52 +1728,66 @@ function set_iso_path {
         if [[ "$DEBUG_MODE" == "true" ]]; then
             print_info "🐛 DEBUG: Applying GPT-specific updates..."
         fi
-        # Replace insmod part_msdos with part_gpt
-        run_cmd sudo sed -i "s/insmod part_msdos/insmod part_gpt/g" "$esp_mount_point/boot/grub/grub.cfg"
-        # Update partition references
-        run_cmd sudo sed -i "s/msdos1/gpt1/g" "$esp_mount_point/boot/grub/grub.cfg"
-        run_cmd sudo sed -i "s/msdos2/gpt2/g" "$esp_mount_point/boot/grub/grub.cfg"
-        # Replace (hd0,1) and (hd0,2) with GPT equivalents
-        run_cmd sudo sed -i "s/'(hd0,1)'/'(hd0,gpt1)'/g" "$esp_mount_point/boot/grub/grub.cfg"
-        run_cmd sudo sed -i "s/'(hd0,2)'/'(hd0,gpt2)'/g" "$esp_mount_point/boot/grub/grub.cfg"
-        run_cmd sudo sed -i "s/=(hd0,1)/=(hd0,gpt1)/g" "$esp_mount_point/boot/grub/grub.cfg"
-        run_cmd sudo sed -i "s/=(hd0,2)/=(hd0,gpt2)/g" "$esp_mount_point/boot/grub/grub.cfg"
-        # Update hint references
-        run_cmd sudo sed -i "s/ahci0,msdos1/ahci0,gpt1/g" "$esp_mount_point/boot/grub/grub.cfg"
-        run_cmd sudo sed -i "s/ahci0,msdos2/ahci0,gpt2/g" "$esp_mount_point/boot/grub/grub.cfg"
+        
+        # Update ESP partition references (msdos1 -> gpt1)
+        run_cmd sudo sed -i "s/set esp_root='hd0,msdos1'/set esp_root='hd0,gpt1'/g" "$esp_mount_point/boot/grub/grub.cfg"
+        run_cmd sudo sed -i "s/--hint-bios=hd0,msdos1 --hint-efi=hd0,msdos1 --hint-baremetal=ahci0,msdos1/$esp_hints/g" "$esp_mount_point/boot/grub/grub.cfg"
+        
+        # Update data partition references (msdos2 -> gpt2)  
+        run_cmd sudo sed -i "s/set data_root='hd0,msdos2'/set data_root='hd0,gpt2'/g" "$esp_mount_point/boot/grub/grub.cfg"
+        run_cmd sudo sed -i "s/--hint-bios=hd0,msdos2 --hint-efi=hd0,msdos2 --hint-baremetal=ahci0,msdos2/$data_hints/g" "$esp_mount_point/boot/grub/grub.cfg"
+        
     else
-        print_info "Using MBR/DOS partition table references (default)..."
+        print_info "Using MBR/DOS partition table references (default in template)..."
         if [[ "$DEBUG_MODE" == "true" ]]; then
-            print_info "🐛 DEBUG: Applying MBR-specific updates..."
+            print_info "🐛 DEBUG: Keeping MBR-specific configuration..."
         fi
-        # Ensure part_msdos is used
-        run_cmd sudo sed -i "s/insmod part_gpt/insmod part_msdos/g" "$esp_mount_point/boot/grub/grub.cfg"
-        # Ensure msdos references are used
-        run_cmd sudo sed -i "s/gpt1/msdos1/g" "$esp_mount_point/boot/grub/grub.cfg"
-        run_cmd sudo sed -i "s/gpt2/msdos2/g" "$esp_mount_point/boot/grub/grub.cfg"
-        # Ensure (hd0,1) and (hd0,2) format is used for MBR
-        run_cmd sudo sed -i "s/'(hd0,gpt1)'/'(hd0,1)'/g" "$esp_mount_point/boot/grub/grub.cfg"
-        run_cmd sudo sed -i "s/'(hd0,gpt2)'/'(hd0,2)'/g" "$esp_mount_point/boot/grub/grub.cfg"
-        run_cmd sudo sed -i "s/=(hd0,gpt1)/=(hd0,1)/g" "$esp_mount_point/boot/grub/grub.cfg"
-        run_cmd sudo sed -i "s/=(hd0,gpt2)/=(hd0,2)/g" "$esp_mount_point/boot/grub/grub.cfg"
-        # Update hint references
-        run_cmd sudo sed -i "s/ahci0,gpt1/ahci0,msdos1/g" "$esp_mount_point/boot/grub/grub.cfg"
-        run_cmd sudo sed -i "s/ahci0,gpt2/ahci0,msdos2/g" "$esp_mount_point/boot/grub/grub.cfg"
+        # Template is already correct for MBR, no changes needed
     fi
     
     if [[ "$DEBUG_MODE" == "true" ]]; then
-        print_info "🐛 DEBUG: Updated grub.cfg content (first 40 lines):"
-        head -40 "$esp_mount_point/boot/grub/grub.cfg" || true
-        print_info "🐛 DEBUG: Checking for UUID replacement:"
-        grep -n "UUID" "$esp_mount_point/boot/grub/grub.cfg" | head -5 || true
-        print_info "🐛 DEBUG: Checking for two-partition configuration:"
-        grep -n "iso_root" "$esp_mount_point/boot/grub/grub.cfg" | head -3 || true
+        print_info "🐛 DEBUG: Updated grub.cfg content (lines with UUIDs):"
+        grep -n "$ESP_UUID\|$DATA_UUID" "$esp_mount_point/boot/grub/grub.cfg" | head -5 || true
+        
+        print_info "🐛 DEBUG: Checking partition references:"
+        if [[ "$PARTITION_TYPE" == "gpt" ]]; then
+            local gpt_esp_refs=$(grep -c "esp_root='hd0,gpt1'" "$esp_mount_point/boot/grub/grub.cfg" || true)
+            local gpt_data_refs=$(grep -c "data_root='hd0,gpt2'" "$esp_mount_point/boot/grub/grub.cfg" || true)
+            print_info "🐛 DEBUG: Found $gpt_esp_refs ESP GPT references, $gpt_data_refs Data GPT references"
+        else
+            local msdos_esp_refs=$(grep -c "esp_root='hd0,msdos1'" "$esp_mount_point/boot/grub/grub.cfg" || true)
+            local msdos_data_refs=$(grep -c "data_root='hd0,msdos2'" "$esp_mount_point/boot/grub/grub.cfg" || true)
+            print_info "🐛 DEBUG: Found $msdos_esp_refs ESP MBR references, $msdos_data_refs Data MBR references"
+        fi
     fi
     
-    print_success "GRUB configuration updated for two-partition layout"
-    print_info "ESP UUID: ${ESP_UUID:-not available}"
-    print_info "Data UUID: ${DATA_UUID:-not available} (for ISO access)"
+    # Validate that partition references were updated correctly
+    if [[ "$PARTITION_TYPE" == "gpt" ]]; then
+        local gpt_esp_count=$(grep -c "esp_root='hd0,gpt1'" "$esp_mount_point/boot/grub/grub.cfg" || true)
+        local gpt_data_count=$(grep -c "data_root='hd0,gpt2'" "$esp_mount_point/boot/grub/grub.cfg" || true)
+        
+        if [[ $gpt_esp_count -gt 0 && $gpt_data_count -gt 0 ]]; then
+            print_success "✅ GPT partition references successfully updated (ESP: $gpt_esp_count, Data: $gpt_data_count)"
+        else
+            print_warning "⚠ GPT update verification failed: ESP refs: $gpt_esp_count, Data refs: $gpt_data_count"
+        fi
+    else
+        local msdos_esp_count=$(grep -c "esp_root='hd0,msdos1'" "$esp_mount_point/boot/grub/grub.cfg" || true)
+        local msdos_data_count=$(grep -c "data_root='hd0,msdos2'" "$esp_mount_point/boot/grub/grub.cfg" || true)
+        
+        if [[ $msdos_esp_count -gt 0 && $msdos_data_count -gt 0 ]]; then
+            print_success "✅ MBR partition references verified (ESP: $msdos_esp_count, Data: $msdos_data_count)"
+        else
+            print_warning "⚠ MBR verification failed: ESP refs: $msdos_esp_count, Data refs: $msdos_data_count"
+        fi
+    fi
+    
+    print_success "GRUB configuration updated for proper two-partition layout"
+    print_info "ESP (Bootloader): UUID=${ESP_UUID} -> \$esp_root variable"
+    print_info "Data (ISOs): UUID=${DATA_UUID} -> \$data_root variable"
     print_info "Partition type: $PARTITION_TYPE"
+    print_info "ESP partition reference: $esp_partition_ref"
+    print_info "Data partition reference: $data_partition_ref"
     
     # Unmount ESP
     safe_umount "$esp_mount_point"
@@ -1938,9 +1969,9 @@ copy_iso_files() {
             local dirty_before_mb=$((dirty_before_kb / 1024))
             
             if [[ $dirty_before_kb -gt 100000 ]]; then  # > 100MB dirty
-                local sync_message="💾 Writing ~${dirty_before_mb}MB of buffered data for $iso_name to data partition..."
+                local sync_message="💾 Syncing ${dirty_before_mb}MB to disk..."
             else
-                local sync_message="💾 Flushing remaining buffered data for $iso_name to data partition..."
+                local sync_message="💾 Syncing buffered data to disk..."
             fi
                 
             local sync_successful=false
@@ -2011,23 +2042,16 @@ generate_advanced_menu_entries_content_two_partition() {
     local entries=""
     local entries_count=0
     
-    # Determine correct partition reference based on partition table type
-    local data_partition_ref
-    if [[ "$PARTITION_TYPE" == "gpt" ]]; then
-        data_partition_ref="gpt2"
-    else
-        data_partition_ref="2"
-    fi
-    
-    print_info "🔍 Analyzing ${#iso_files[@]} ISO(s) with advanced detection (two-partition layout)..."
+    # Analyze ISOs quietly - all print statements go to stderr, not stdout
+    >&2 print_info "🔍 Analyzing ${#iso_files[@]} ISO(s) with advanced detection (two-partition layout)..."
     
     for iso_path in "${iso_files[@]}"; do
         local iso_name=$(basename "$iso_path")
-        print_info "📝 Analyzing $iso_name with advanced detection..."
+        >&2 print_info "📝 Analyzing $iso_name with advanced detection..."
         
         # Use the detection function to analyze the ISO
         if detect_iso_boot_files "$iso_path"; then
-            print_success "✓ Detected: $ISO_DISTRO (kernel: $ISO_KERNEL, initrd: $ISO_INITRD)"
+            >&2 print_success "✓ Detected: $ISO_DISTRO (kernel: $ISO_KERNEL, initrd: $ISO_INITRD)"
             
             # Set appropriate boot parameters based on distribution
             set_iso_boot_params "$ISO_DISTRO" "$data_mount_point"
@@ -2058,10 +2082,7 @@ generate_advanced_menu_entries_content_two_partition() {
             entries+="# $ISO_DISTRO - $iso_name (Data Partition, Auto-detected)"$'\n'
             entries+="menuentry \"$entry_title\" --class $class_name --class linux {"$'\n'
             entries+="    # Set root to data partition where ISOs are stored"$'\n'
-            entries+="    set root='(hd0,$data_partition_ref)'"$'\n'
-            if [[ -n "$DATA_UUID" ]]; then
-                entries+="    search --no-floppy --fs-uuid --set=root $DATA_UUID"$'\n'
-            fi
+            entries+="    set root=\$data_root"$'\n'
             entries+="    set isofile=\"/$iso_name\""$'\n'
             entries+="    loopback loop \$isofile"$'\n'
             
@@ -2069,32 +2090,29 @@ generate_advanced_menu_entries_content_two_partition() {
                 entries+="    linux (loop)$ISO_KERNEL $ISO_BOOT_PARAMS"$'\n'
             else
                 entries+="    # ERROR: No kernel found for $iso_name!"$'\n'
-                print_warning "⚠ No kernel detected for $iso_name"
+                >&2 print_warning "⚠ No kernel detected for $iso_name"
             fi
             
             if [[ -n "$ISO_INITRD" ]]; then
                 entries+="    initrd (loop)$ISO_INITRD"$'\n'
             else
                 entries+="    # WARNING: No initrd found for $iso_name"$'\n'
-                print_warning "⚠ No initrd detected for $iso_name"
+                >&2 print_warning "⚠ No initrd detected for $iso_name"
             fi
             
             entries+="}"$'\n'
             entries+=""$'\n'
             ((entries_count++))
-            print_success "✓ Added advanced entry for $ISO_DISTRO (two-partition)"
+            >&2 print_success "✓ Added advanced entry for $ISO_DISTRO (two-partition)"
             
         else
-            print_warning "⚠ Could not detect boot files for $iso_name, creating generic entry..."
+            >&2 print_warning "⚠ Could not detect boot files for $iso_name, creating generic entry..."
             
             # Fallback to generic entry for two-partition layout
             entries+="# Generic entry for $iso_name (auto-detection failed, two-partition)"$'\n'
             entries+="menuentry \"Linux ISO - $iso_name\" --class linux {"$'\n'
             entries+="    # Set root to data partition where ISOs are stored"$'\n'
-            entries+="    set root='(hd0,$data_partition_ref)'"$'\n'
-            if [[ -n "$DATA_UUID" ]]; then
-                entries+="    search --no-floppy --fs-uuid --set=root $DATA_UUID"$'\n'
-            fi
+            entries+="    set root=\$data_root"$'\n'
             entries+="    set isofile=\"/$iso_name\""$'\n'
             entries+="    loopback loop \$isofile"$'\n'
             entries+="    linux (loop)/casper/vmlinuz boot=casper iso-scan/filename=\${isofile} quiet splash"$'\n'
@@ -2102,14 +2120,14 @@ generate_advanced_menu_entries_content_two_partition() {
             entries+="}"$'\n'
             entries+=""$'\n'
             ((entries_count++))
-            print_success "✓ Added generic entry (two-partition)"
+            >&2 print_success "✓ Added generic entry (two-partition)"
         fi
     done
     
     if [[ $entries_count -gt 0 ]]; then
-        print_success "📝 Generated $entries_count advanced menu entries for two-partition layout"
+        >&2 print_success "📝 Generated $entries_count advanced menu entries for two-partition layout"
     else
-        print_warning "⚠ No advanced menu entries were created"
+        >&2 print_warning "⚠ No advanced menu entries were created"
     fi
     
     echo "$entries"
@@ -2207,29 +2225,18 @@ generate_manual_menu_entries_content_two_partition() {
     local entries=""
     local entries_count=0
     
-    # Determine correct partition reference based on partition table type
-    local data_partition_ref
-    if [[ "$PARTITION_TYPE" == "gpt" ]]; then
-        data_partition_ref="gpt2"
-    else
-        data_partition_ref="2"
-    fi
-    
     for iso_path in "${iso_files[@]}"; do
         local iso_name=$(basename "$iso_path")
         local iso_lower=$(echo "$iso_name" | tr '[:upper:]' '[:lower:]')
         
-        print_info "📝 Creating manual entry for $iso_name (two-partition layout)..."
+        >&2 print_info "📝 Creating manual entry for $iso_name (two-partition layout)..."
         
         # Linux Mint entries
         if [[ "$iso_lower" == *"mint"* ]]; then
             entries+="# Linux Mint - $iso_name (Data Partition)"$'\n'
             entries+="menuentry \"Linux Mint - $iso_name\" --class mint --class linux {"$'\n'
             entries+="    # Set root to data partition where ISOs are stored"$'\n'
-            entries+="    set root='(hd0,$data_partition_ref)'"$'\n'
-            if [[ -n "$DATA_UUID" ]]; then
-                entries+="    search --no-floppy --fs-uuid --set=root $DATA_UUID"$'\n'
-            fi
+            entries+="    set root=\$data_root"$'\n'
             entries+="    set isofile=\"/$iso_name\""$'\n'
             entries+="    loopback loop \$isofile"$'\n'
             entries+="    linux (loop)/casper/vmlinuz boot=casper iso-scan/filename=\${isofile} quiet splash vt.global_cursor_default=0 loglevel=2 rd.systemd.show_status=false rd.udev.log-priority=3 sysrq_always_enabled=1 cow_spacesize=1G"$'\n'
@@ -2237,17 +2244,14 @@ generate_manual_menu_entries_content_two_partition() {
             entries+="}"$'\n'
             entries+=""$'\n'
             ((entries_count++))
-            print_success "✓ Added Linux Mint entry (two-partition)"
+            >&2 print_success "✓ Added Linux Mint entry (two-partition)"
             
         # Kubuntu entries  
         elif [[ "$iso_lower" == *"kubuntu"* ]]; then
             entries+="# Kubuntu - $iso_name (Data Partition)"$'\n'
             entries+="menuentry \"Kubuntu - $iso_name\" --class kubuntu --class linux {"$'\n'
             entries+="    # Set root to data partition where ISOs are stored"$'\n'
-            entries+="    set root='(hd0,$data_partition_ref)'"$'\n'
-            if [[ -n "$DATA_UUID" ]]; then
-                entries+="    search --no-floppy --fs-uuid --set=root $DATA_UUID"$'\n'
-            fi
+            entries+="    set root=\$data_root"$'\n'
             entries+="    set isofile=\"/$iso_name\""$'\n'
             entries+="    loopback loop \$isofile"$'\n'
             entries+="    linux (loop)/casper/vmlinuz boot=casper iso-scan/filename=\${isofile} quiet splash"$'\n'
@@ -2255,17 +2259,14 @@ generate_manual_menu_entries_content_two_partition() {
             entries+="}"$'\n'
             entries+=""$'\n'
             ((entries_count++))
-            print_success "✓ Added Kubuntu entry (two-partition)"
+            >&2 print_success "✓ Added Kubuntu entry (two-partition)"
             
         # Ubuntu entries
         elif [[ "$iso_lower" == *"ubuntu"* ]]; then
             entries+="# Ubuntu - $iso_name (Data Partition)"$'\n'
             entries+="menuentry \"Ubuntu - $iso_name\" --class ubuntu --class linux {"$'\n'
             entries+="    # Set root to data partition where ISOs are stored"$'\n'
-            entries+="    set root='(hd0,$data_partition_ref)'"$'\n'
-            if [[ -n "$DATA_UUID" ]]; then
-                entries+="    search --no-floppy --fs-uuid --set=root $DATA_UUID"$'\n'
-            fi
+            entries+="    set root=\$data_root"$'\n'
             entries+="    set isofile=\"/$iso_name\""$'\n'
             entries+="    loopback loop \$isofile"$'\n'
             entries+="    linux (loop)/casper/vmlinuz boot=casper iso-scan/filename=\${isofile} quiet splash"$'\n'
@@ -2273,17 +2274,14 @@ generate_manual_menu_entries_content_two_partition() {
             entries+="}"$'\n'
             entries+=""$'\n'
             ((entries_count++))
-            print_success "✓ Added Ubuntu entry (two-partition)"
+            >&2 print_success "✓ Added Ubuntu entry (two-partition)"
             
         # Generic entries for other ISOs
         else
             entries+="# Generic Linux - $iso_name (Data Partition)"$'\n'
             entries+="menuentry \"Linux ISO - $iso_name\" --class linux {"$'\n'
             entries+="    # Set root to data partition where ISOs are stored"$'\n'
-            entries+="    set root='(hd0,$data_partition_ref)'"$'\n'
-            if [[ -n "$DATA_UUID" ]]; then
-                entries+="    search --no-floppy --fs-uuid --set=root $DATA_UUID"$'\n'
-            fi
+            entries+="    set root=\$data_root"$'\n'
             entries+="    set isofile=\"/$iso_name\""$'\n'
             entries+="    loopback loop \$isofile"$'\n'
             entries+="    linux (loop)/casper/vmlinuz boot=casper iso-scan/filename=\${isofile} quiet splash"$'\n'
@@ -2291,14 +2289,14 @@ generate_manual_menu_entries_content_two_partition() {
             entries+="}"$'\n'
             entries+=""$'\n'
             ((entries_count++))
-            print_success "✓ Added generic entry (two-partition)"
+            >&2 print_success "✓ Added generic entry (two-partition)"
         fi
     done
     
     if [[ $entries_count -gt 0 ]]; then
-        print_success "📝 Generated $entries_count manual menu entries for two-partition layout"
+        >&2 print_success "📝 Generated $entries_count manual menu entries for two-partition layout"
     else
-        print_warning "⚠ No manual entries were created"
+        >&2 print_warning "⚠ No manual entries were created"
     fi
     
     echo "$entries"
