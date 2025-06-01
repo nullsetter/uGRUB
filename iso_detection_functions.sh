@@ -202,8 +202,13 @@ set_iso_boot_params() {
     local mount_point="$2"
     
     case "$distro" in
-        ubuntu|kubuntu|xubuntu|lubuntu|mint|elementary|debian)
+        ubuntu|kubuntu|xubuntu|lubuntu|elementary|debian)
             ISO_BOOT_PARAMS="boot=casper iso-scan/filename=\${isofile} quiet splash"
+            ;;
+        mint)
+            # Linux Mint requires special handling for two-partition layout
+            # Use findiso parameter which works better than iso-scan for exFAT partition
+            ISO_BOOT_PARAMS="boot=casper findiso=\${isofile} quiet splash"
             ;;
         arch|manjaro|antergos)
             ISO_BOOT_PARAMS="img_loop=\${isofile} driver=free quiet splash cow_spacesize=1G"
@@ -218,7 +223,8 @@ set_iso_boot_params() {
             ISO_BOOT_PARAMS="boot=live components quiet splash findiso=\${isofile}"
             ;;
         *)
-            ISO_BOOT_PARAMS="iso-scan/filename=\${isofile} quiet splash"
+            # Default fallback - try findiso first, then iso-scan
+            ISO_BOOT_PARAMS="boot=casper findiso=\${isofile} quiet splash"
             ;;
     esac
 }

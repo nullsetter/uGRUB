@@ -2053,8 +2053,20 @@ generate_advanced_menu_entries_content_two_partition() {
         if detect_iso_boot_files "$iso_path"; then
             >&2 print_success "✓ Detected: $ISO_DISTRO (kernel: $ISO_KERNEL, initrd: $ISO_INITRD)"
             
-            # Set appropriate boot parameters based on distribution
-            set_iso_boot_params "$ISO_DISTRO" "$data_mount_point"
+            # Set appropriate boot parameters based on distribution for two-partition layout
+            local enhanced_boot_params=""
+            case "$ISO_DISTRO" in
+                mint)
+                    # Linux Mint requires special handling for two-partition layout
+                    enhanced_boot_params="boot=casper findiso=\${isofile} toram quiet splash"
+                    ;;
+                ubuntu|kubuntu|xubuntu|lubuntu|elementary|debian)
+                    enhanced_boot_params="boot=casper iso-scan/filename=\${isofile} quiet splash"
+                    ;;
+                *)
+                    enhanced_boot_params="$ISO_BOOT_PARAMS"
+                    ;;
+            esac
             
             # Generate entry title
             local entry_title=""
@@ -2081,13 +2093,22 @@ generate_advanced_menu_entries_content_two_partition() {
             # Build the menu entry for two-partition layout
             entries+="# $ISO_DISTRO - $iso_name (Data Partition, Auto-detected)"$'\n'
             entries+="menuentry \"$entry_title\" --class $class_name --class linux {"$'\n'
+            
+            # Add required modules for two-partition layout
+            entries+="    # Load required modules for two-partition layout"$'\n'
+            entries+="    insmod exfat"$'\n'
+            entries+="    insmod fat"$'\n'
+            entries+="    insmod iso9660"$'\n'
+            entries+="    insmod loopback"$'\n'
+            entries+="    "$'\n'
+            
             entries+="    # Set root to data partition where ISOs are stored"$'\n'
             entries+="    set root=\$data_root"$'\n'
             entries+="    set isofile=\"/$iso_name\""$'\n'
             entries+="    loopback loop \$isofile"$'\n'
             
             if [[ -n "$ISO_KERNEL" ]]; then
-                entries+="    linux (loop)$ISO_KERNEL $ISO_BOOT_PARAMS"$'\n'
+                entries+="    linux (loop)$ISO_KERNEL $enhanced_boot_params"$'\n'
             else
                 entries+="    # ERROR: No kernel found for $iso_name!"$'\n'
                 >&2 print_warning "⚠ No kernel detected for $iso_name"
@@ -2111,11 +2132,17 @@ generate_advanced_menu_entries_content_two_partition() {
             # Fallback to generic entry for two-partition layout
             entries+="# Generic entry for $iso_name (auto-detection failed, two-partition)"$'\n'
             entries+="menuentry \"Linux ISO - $iso_name\" --class linux {"$'\n'
+            entries+="    # Load required modules"$'\n'
+            entries+="    insmod exfat"$'\n'
+            entries+="    insmod fat"$'\n'
+            entries+="    insmod iso9660"$'\n'
+            entries+="    insmod loopback"$'\n'
+            entries+="    "$'\n'
             entries+="    # Set root to data partition where ISOs are stored"$'\n'
             entries+="    set root=\$data_root"$'\n'
             entries+="    set isofile=\"/$iso_name\""$'\n'
             entries+="    loopback loop \$isofile"$'\n'
-            entries+="    linux (loop)/casper/vmlinuz boot=casper iso-scan/filename=\${isofile} quiet splash"$'\n'
+            entries+="    linux (loop)/casper/vmlinuz boot=casper findiso=\${isofile} quiet splash"$'\n'
             entries+="    initrd (loop)/casper/initrd"$'\n'
             entries+="}"$'\n'
             entries+=""$'\n'
